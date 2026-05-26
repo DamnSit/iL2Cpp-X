@@ -74,77 +74,210 @@ struct VersionConfig {
     header_range_count: usize,
 }
 
-fn version_config(version: u32) -> VersionConfig {
-    // TypeDef offsets
-    let (type_def_size, type_field_start, type_method_start, type_property_start,
-         type_method_count, type_property_count, type_field_count) = match version {
-        16..=19 => (64,  56, 60, 68, 80, 82, 84),
-        20..=22 => (72,  56, 60, 68, 80, 82, 84),
-        23      => (80,  56, 60, 68, 80, 82, 84),
-        24..=26 => (96,  52, 56, 64, 72, 74, 76),
-        27..=28 => (104, 52, 56, 64, 72, 74, 76),
-        29..=30 => (112, 52, 56, 64, 72, 74, 76),
-        31..=32 => (120, 52, 56, 64, 72, 74, 76),
-        33..=34 => (128, 52, 56, 64, 72, 74, 76),
-        _       => (136, 52, 56, 64, 72, 74, 76), // v35+
+/// Detect the stride for a metadata table by testing candidate strides.
+/// Returns the stride that produces the best combined score of valid strings + unique names + reasonable count.
+fn detect_stride(
+    reader: &BinaryReader,
+    ranges: &[MetadataRange],
+    table_name: &str,
+    candidates: &[usize],
+    use_varint: bool,
+) -> usize {
+    let table_range = match ranges.iter().find(|r| r.name == table_name) {
+        Some(r) => r,
+        None => return candidates[0],
     };
-
-    // MethodDef offsets
-    let (method_def_size, method_return_type, method_parameter_start,
-         method_token, method_param_count, method_flags, method_iflags) = match version {
-        16..=23 => (28, 8, 12, 24, 18, 20, 22),
-        24..=30 => (32, 8, 12, 28, 20, 22, 24),
-        31..=32 => (36, 8, 12, 32, 20, 22, 24),
-        _       => (40, 8, 12, 32, 20, 22, 24), // v33+
-    };
-
-    // FieldDef
-    let field_def_size = if version >= 33 { 16 } else { 12 };
-
-    // ParameterDef
-    let (param_def_size, param_type_index) = if version >= 24 {
-        (16, 12)
-    } else {
-        (8, 4)
-    };
-
-    // ImageDef
-    let (image_def_size, image_name_offset, image_type_start_offset, image_type_count_offset) = if version >= 31 {
-        (64, 16, 8, 12)
-    } else if version >= 24 {
-        (40, 0, 8, 12)
-    } else {
-        (32, 0, 8, 12)
-    };
-
-    let use_varint_strings = version >= 33;
-    let header_range_count = if version >= 24 { 34 } else { 24 };
-
-    VersionConfig {
-        type_def_size,
-        type_field_start,
-        type_method_start,
-        type_property_start,
-        type_method_count,
-        type_property_count,
-        type_field_count,
-        method_def_size,
-        method_return_type,
-        method_parameter_start,
-        method_token,
-        method_param_count,
-        method_flags,
-        method_iflags,
-        field_def_size,
-        param_def_size,
-        param_type_index,
-        image_def_size,
-        image_name_offset,
-        image_type_start_offset,
-        image_type_count_offset,
-        use_varint_strings,
-        header_range_count,
+    if table_range.size == 0 {
+        return candidates[0];
     }
+
+    let string_range = match ranges.iter().find(|r| r.name == "string") {
+        Some(r) => r,
+        None => return candidates[0],
+    };
+
+    let mut best_stride = candidates[0];
+    let mut best_score = 0i32;
+
+    for &stride in candidates {
+        if table_range.size % stride != 0 {
+            continue;
+        }
+        let count = table_range.size / stride;
+        if count < 2 {
+            continue;
+        }
+        let sample = std::cmp::min(count, 50);
+        let mut valid = 0i32;
+        let mut unique_names = std::collections::HashSet::new();
+        for i in 0..sample {
+            let offset = table_range.offset + i * stride;
+            if offset + 4 > reader.size() {
+                break;
+            }
+            let name_idx = reader.read_i32_le(offset).unwrap_or(0);
+            unique_names.insert(name_idx);
+            if is_valid_string_index(reader, string_range, name_idx, use_varint) {
+                valid += 1;
+            }
+        }
+        // Score combines: valid string ratio + uniqueness ratio
+        // Unique names are important — with wrong stride, consecutive entries share nameIndex
+        let score = valid * 2 + unique_names.len() as i32;
+        if score > best_score {
+            best_score = score;
+            best_stride = stride;
+        }
+    }
+
+    best_stride
+}
+
+/// Check if a string index points to a valid non-empty string.
+fn is_valid_string_index(
+    reader: &BinaryReader,
+    string_range: &MetadataRange,
+    idx: i32,
+    use_varint: bool,
+) -> bool {
+    if idx < 0 || string_range.size == 0 {
+        return false;
+    }
+    let idx = idx as usize;
+    if idx >= string_range.size {
+        return false;
+    }
+    let abs = string_range.offset + idx;
+    if abs >= reader.size() {
+        return false;
+    }
+    if use_varint {
+        match reader.read_uleb128(abs) {
+            Some((len, _)) if len > 0 => {
+                let s_start = abs + 1; // at least 1 byte consumed
+                s_start + (len as usize) <= reader.size()
+            }
+            _ => false,
+        }
+    } else {
+        // Check that the first two bytes look like a real string (not just any non-null byte)
+        let b0 = match reader.read_u8(abs) {
+            Some(b) if b != 0 => b,
+            _ => return false,
+        };
+        // First byte should be a letter, underscore, or '<' (common in IL2CPP names)
+        if !(b0.is_ascii_alphabetic() || b0 == b'_' || b0 == b'<') {
+            return false;
+        }
+        // Second byte should be non-null (strings are at least 2 chars for stride detection)
+        match reader.read_u8(abs + 1) {
+            Some(b) if b != 0 => true,
+            _ => false,
+        }
+    }
+}
+
+/// Detect the TypeDef field offsets by analyzing the data.
+/// Returns (field_start, method_start, property_start, method_count, property_count, field_count).
+fn detect_type_offsets(
+    reader: &BinaryReader,
+    ranges: &[MetadataRange],
+    type_range: &MetadataRange,
+    stride: usize,
+    version: u32,
+) -> (usize, usize, usize, usize, usize, usize) {
+    // Known layouts by version range (from Cpp2IL analysis)
+    // (field_start, method_start, property_start, method_count_offset, property_count_offset, field_count_offset)
+    // These are the MOST COMMON layouts. We validate them below.
+    let candidates: Vec<(usize, usize, usize, usize, usize, usize)> = match (version, stride) {
+        // v16-v23, stride 64-80
+        (16..=23, _) => vec![
+            (56, 60, 68, 80, 82, 84), // v16-v23 standard
+        ],
+        // v24-v30, stride 96-112
+        (24..=30, _) => vec![
+            (52, 56, 64, 72, 74, 76), // v24-v30 standard
+        ],
+        // v31+ with various strides
+        (_, 88) => vec![
+            // Confirmed layout for v31 stride 88:
+            // fieldStart=+32, methodStart=+36, propertyStart=+44
+            // method_count=+64(u16), property_count=+66(u16), field_count=+68(u16)
+            (32, 36, 44, 64, 66, 68), // stride 88 confirmed
+        ],
+        (_, 96) => vec![
+            (52, 56, 64, 72, 74, 76), // v24-v30 standard
+        ],
+        (_, 104) => vec![
+            (52, 56, 64, 72, 74, 76), // v27-v28 standard
+        ],
+        (_, 112) => vec![
+            (52, 56, 64, 72, 74, 76), // v29-v30 standard
+        ],
+        (_, 120) => vec![
+            (52, 56, 64, 72, 74, 76), // v31-v32 standard
+        ],
+        (_, 128) => vec![
+            (52, 56, 64, 72, 74, 76), // v33-v34 standard
+        ],
+        (_, 136) => vec![
+            (52, 56, 64, 72, 74, 76), // v35+ standard
+        ],
+        _ => vec![
+            (52, 56, 64, 72, 74, 76), // default
+            (40, 44, 52, 64, 66, 68), // compact
+        ],
+    };
+
+    let string_range = match ranges.iter().find(|r| r.name == "string") {
+        Some(r) => r,
+        None => return candidates[0],
+    };
+
+    // For each candidate layout, check if the namespaceIndex at +4 produces valid strings
+    // and if method_count values are reasonable (< 1000 for most types)
+    let mut best = candidates[0];
+    let mut best_score = 0i32;
+
+    for &(fs, ms, ps, mc, pc, fc) in &candidates {
+        if fs + 4 > stride || ms + 4 > stride || ps + 4 > stride
+            || mc + 2 > stride || pc + 2 > stride || fc + 2 > stride
+        {
+            continue;
+        }
+
+        let sample = std::cmp::min(type_range.size / stride, 100);
+        let mut score = 0i32;
+
+        for i in 0..sample {
+            let offset = type_range.offset + i * stride;
+
+            // Check namespaceIndex at +4
+            let ns_idx = reader.read_i32_le(offset + 4).unwrap_or(0);
+            if ns_idx >= 0 && (ns_idx as usize) < string_range.size {
+                score += 1;
+            }
+
+            // Check method_count is reasonable
+            let method_count = reader.read_u16_le(offset + mc).unwrap_or(0xFFFF);
+            if method_count < 1000 {
+                score += 2;
+            }
+
+            // Check field_count is reasonable
+            let field_count = reader.read_u16_le(offset + fc).unwrap_or(0xFFFF);
+            if field_count < 5000 {
+                score += 1;
+            }
+        }
+
+        if score > best_score {
+            best_score = score;
+            best = (fs, ms, ps, mc, pc, fc);
+        }
+    }
+
+    best
 }
 
 pub struct MetadataParser;
@@ -181,12 +314,90 @@ impl MetadataParser {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "Gagal membaca version")
         })?;
 
-        let config = version_config(version);
-        let ranges = read_header_ranges(reader, config.header_range_count)?;
+        let use_varint = version >= 33;
+        let header_range_count = if version >= 24 { 34 } else { 24 };
+
+        let ranges = read_header_ranges(reader, header_range_count)?;
         validate_ranges(reader, &ranges)?;
 
+        // Auto-detect strides
+        let type_def_size = detect_stride(
+            reader, &ranges, "typeDefinitions",
+            &[64, 72, 80, 88, 96, 104, 112, 120, 128, 136],
+            use_varint,
+        );
+        let method_def_size = detect_stride(
+            reader, &ranges, "methods",
+            &[24, 28, 32, 36, 40, 44],
+            use_varint,
+        );
+        let field_def_size = detect_stride(
+            reader, &ranges, "fields",
+            &[8, 12, 16],
+            use_varint,
+        );
+        let param_def_size = detect_stride(
+            reader, &ranges, "parameters",
+            &[8, 12, 16],
+            use_varint,
+        );
+        let image_def_size = detect_stride(
+            reader, &ranges, "images",
+            &[24, 32, 40, 48, 56, 64],
+            use_varint,
+        );
+
+        // Detect TypeDef field offsets
+        let type_range = ranges.iter().find(|r| r.name == "typeDefinitions");
+        let (type_field_start, type_method_start, type_property_start,
+             type_method_count, type_property_count, type_field_count) =
+            if let Some(tr) = type_range {
+                detect_type_offsets(reader, &ranges, tr, type_def_size, version)
+            } else {
+                (52, 56, 64, 72, 74, 76)
+            };
+
+        // ImageDef name offset detection: find which i32 offset has valid string indices
+        let image_name_offset = detect_image_name_offset(reader, &ranges, image_def_size);
+        let (image_type_start_offset, image_type_count_offset) =
+            detect_image_type_offsets(reader, &ranges, image_def_size, image_name_offset);
+
+        // MethodDef field offsets
+        let (method_return_type, method_parameter_start, method_token,
+             method_param_count, method_flags, method_iflags) =
+            detect_method_offsets(method_def_size, version);
+
+        // ParameterDef type_index offset
+        let param_type_index = if param_def_size >= 12 { 12 } else { 4 };
+
+        let config = VersionConfig {
+            type_def_size,
+            type_field_start,
+            type_method_start,
+            type_property_start,
+            type_method_count,
+            type_property_count,
+            type_field_count,
+            method_def_size,
+            method_return_type,
+            method_parameter_start,
+            method_token,
+            method_param_count,
+            method_flags,
+            method_iflags,
+            field_def_size,
+            param_def_size,
+            param_type_index,
+            image_def_size,
+            image_name_offset,
+            image_type_start_offset,
+            image_type_count_offset,
+            use_varint_strings: use_varint,
+            header_range_count,
+        };
+
         let string_literals = read_string_literals(reader, &ranges);
-        let string_offsets = if config.use_varint_strings {
+        let string_offsets = if use_varint {
             build_string_offsets(reader, &ranges)
         } else {
             Vec::new()
@@ -210,6 +421,167 @@ impl MetadataParser {
             parameters,
             string_offsets,
         })
+    }
+}
+
+/// Read a null-terminated string at absolute offset, return it if it looks like an image name.
+fn read_nt_string_at(reader: &BinaryReader, abs_offset: usize) -> Option<String> {
+    if abs_offset >= reader.size() {
+        return None;
+    }
+    let mut len = 0;
+    while len < 256 && abs_offset + len < reader.size() {
+        match reader.read_u8(abs_offset + len) {
+            Some(0) | None => break,
+            _ => len += 1,
+        }
+    }
+    if len < 2 {
+        return None;
+    }
+    reader.utf8_string(abs_offset, len)
+}
+
+/// Score a string as a plausible image/assembly name.
+/// Names like "Assembly-CSharp.dll", "mscorlib.dll", "UnityEngine.dll" score high.
+fn score_image_name(s: &str) -> i32 {
+    if s.is_empty() {
+        return 0;
+    }
+    let mut score = 0i32;
+    // Contains a dot (like ".dll") is a strong signal
+    if s.contains('.') {
+        score += 10;
+    }
+    // Contains a hyphen (like "Assembly-CSharp")
+    if s.contains('-') {
+        score += 5;
+    }
+    // Length between 3 and 80 is reasonable
+    if s.len() >= 3 && s.len() <= 80 {
+        score += 3;
+    }
+    // All alphanumeric + common chars
+    if s.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_') {
+        score += 2;
+    }
+    score
+}
+
+/// Detect the ImageDef nameIndex offset by finding which i32 field produces the best image names.
+fn detect_image_name_offset(
+    reader: &BinaryReader,
+    ranges: &[MetadataRange],
+    stride: usize,
+) -> usize {
+    let image_range = match ranges.iter().find(|r| r.name == "images") {
+        Some(r) => r,
+        None => return 0,
+    };
+    let string_range = match ranges.iter().find(|r| r.name == "string") {
+        Some(r) => r,
+        None => return 0,
+    };
+    let count = image_range.size / stride;
+    if count < 2 {
+        return 0;
+    }
+
+    let mut best_offset = 0usize;
+    let mut best_score = 0i32;
+
+    for off in (0..stride).step_by(4) {
+        let mut total_score = 0i32;
+        for i in 0..std::cmp::min(count, 30) {
+            let base = image_range.offset + i * stride;
+            let idx = reader.read_i32_le(base + off).unwrap_or(0);
+            if idx > 0 && (idx as usize) < string_range.size {
+                let abs = string_range.offset + idx as usize;
+                if let Some(s) = read_nt_string_at(reader, abs) {
+                    total_score += score_image_name(&s);
+                }
+            }
+        }
+        if total_score > best_score {
+            best_score = total_score;
+            best_offset = off;
+        }
+    }
+    best_offset
+}
+
+/// Detect the ImageDef typeStart and typeCount offsets.
+fn detect_image_type_offsets(
+    reader: &BinaryReader,
+    ranges: &[MetadataRange],
+    stride: usize,
+    name_offset: usize,
+) -> (usize, usize) {
+    let image_range = match ranges.iter().find(|r| r.name == "images") {
+        Some(r) => r,
+        None => return (8, 12),
+    };
+    let count = image_range.size / stride;
+    if count < 3 {
+        return (8, 12);
+    }
+
+    // typeStart should be sequential (0, X, Y, Z...) and typeCount should be > 0 for most images
+    let mut best = (8usize, 12usize);
+    let mut best_score = 0i32;
+
+    for ts_off in (0..stride).step_by(4) {
+        if ts_off == name_offset {
+            continue;
+        }
+        for tc_off in (ts_off + 4..stride).step_by(4) {
+            if tc_off == name_offset || tc_off == ts_off {
+                continue;
+            }
+            let mut score = 0i32;
+            let mut prev_end: i32 = -1;
+            for i in 0..std::cmp::min(count, 30) {
+                let base = image_range.offset + i * stride;
+                let ts = reader.read_i32_le(base + ts_off).unwrap_or(-1);
+                let tc = reader.read_i32_le(base + tc_off).unwrap_or(0);
+                // typeStart should be >= previous end (sequential)
+                if ts >= 0 && tc > 0 && tc < 100000 {
+                    score += 2;
+                    if ts >= prev_end {
+                        score += 1;
+                    }
+                    prev_end = ts + tc;
+                }
+            }
+            if score > best_score {
+                best_score = score;
+                best = (ts_off, tc_off);
+            }
+        }
+    }
+    best
+}
+
+/// Detect MethodDef field offsets based on stride and version.
+fn detect_method_offsets(stride: usize, _version: u32) -> (usize, usize, usize, usize, usize, usize) {
+    // Common MethodDef layouts:
+    // v16-v23 (stride=28): nameIndex(+0), declaringType(+4), returnType(+8), parameterStart(+12),
+    //   genericContainerIndex(+16), methodIndex(+20), invokerIndex(+24)...
+    //   parameterCount at +18, flags at +20, iflags at +22, token at +24
+    //
+    // v24-v30 (stride=32): nameIndex(+0), declaringType(+4), returnType(+8), parameterStart(+12),
+    //   genericContainerIndex(+16), parameterCount(+20), flags(+22), iflags(+24), slot(+26), token(+28)
+    //
+    // v31+ (stride=36): like v24 but genericContainerIndex is i64 (+16..+24)
+    //   parameterCount(+20), flags(+22), iflags(+24), slot(+26), token(+32)
+    //
+    // v33+ (stride=40): extra fields after token
+
+    match stride {
+        24..=28 => (8, 12, 24, 18, 20, 22), // v16-v23
+        30..=32 => (8, 12, 28, 20, 22, 24), // v24-v30
+        34..=36 => (8, 12, 32, 20, 22, 24), // v31-v32
+        _       => (8, 12, 32, 20, 22, 24), // v33+
     }
 }
 
@@ -257,7 +629,6 @@ fn validate_ranges(reader: &BinaryReader, ranges: &[MetadataRange]) -> std::io::
 }
 
 /// Build a lookup table of byte offsets for each string in the string pool (v33+ varint format).
-/// For v16-v32 (null-terminated), the string_index IS the byte offset, so no table is needed.
 fn build_string_offsets(reader: &BinaryReader, ranges: &[MetadataRange]) -> Vec<u32> {
     let string_range = match ranges.iter().find(|r| r.name == "string") {
         Some(r) => r,
@@ -293,13 +664,11 @@ fn read_metadata_string(
         Some(r) => r,
         None => return String::new(),
     };
-    if string_index == 0 || string_range.size == 0 {
+    if string_range.size == 0 {
         return String::new();
     }
 
     if use_varint {
-        // v33+: string_index is a byte offset into the string pool.
-        // Each entry is ULEB128 length prefix followed by that many bytes of string data.
         if string_index >= string_range.size {
             return String::new();
         }
@@ -311,7 +680,6 @@ fn read_metadata_string(
             None => String::new(),
         }
     } else {
-        // v16-v32: null-terminated string at byte offset.
         if string_index >= string_range.size {
             return String::new();
         }
