@@ -1,0 +1,29 @@
+# Android / Gradle
+.cg/
+.gradle/
+build/
+app/build/
+local.properties
+*.iml
+.idea/
+*.apk
+*.aab
+*.jks
+*.keystore
+release.keystore
+release.properties
+
+# Rust / Native
+native/target/
+native/.cargo/config.toml
+*.so
+*.dll
+*.exe
+*.dylib
+*.pdb
+dump_output/
+
+# General
+.DS_Store
+Thumbs.db
+*.log

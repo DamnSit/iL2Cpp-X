@@ -1,0 +1,8 @@
+/target
+/.cargo/config.toml
+*.so
+*.dll
+*.exe
+*.dylib
+*.pdb
+dump_output/
