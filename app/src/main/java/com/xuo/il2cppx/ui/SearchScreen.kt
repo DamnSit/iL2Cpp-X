@@ -1,5 +1,9 @@
 package com.xuo.il2cppx.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.widget.Toast
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -18,6 +22,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -34,13 +39,22 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import com.xuo.il2cppx.engine.MetadataParseResult
-import com.xuo.il2cppx.engine.MetadataTypeDefinition
 import com.xuo.il2cppx.engine.RvaResult
+import com.xuo.il2cppx.ui.theme.NeonGreen
+import com.xuo.il2cppx.ui.theme.NeonGreenDim
+import com.xuo.il2cppx.ui.theme.DarkCard
+import com.xuo.il2cppx.ui.theme.DarkCardClass
+import com.xuo.il2cppx.ui.theme.DarkCardMethod
+import com.xuo.il2cppx.ui.theme.DarkCardField
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -63,6 +77,7 @@ fun SearchScreen(
         EmptySearchState(isLoading, onBack)
         return
     }
+    val context = LocalContext.current
     var query by remember { mutableStateOf("") }
     var selectedFilter by remember { mutableStateOf(SearchFilter.All) }
     var searchResults by remember { mutableStateOf<List<SearchResultItem>>(emptyList()) }
@@ -84,12 +99,12 @@ fun SearchScreen(
                 title = { Text("Cari Dump") },
                 modifier = Modifier.statusBarsPadding(),
                 colors = TopAppBarDefaults.smallTopAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    titleContentColor = MaterialTheme.colorScheme.onPrimary
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    titleContentColor = NeonGreen
                 ),
                 navigationIcon = {
                     TextButton(onClick = onBack) {
-                        Text("< Kembali", color = MaterialTheme.colorScheme.onPrimary)
+                        Text("< Kembali", color = NeonGreen)
                     }
                 }
             )
@@ -102,7 +117,6 @@ fun SearchScreen(
             color = MaterialTheme.colorScheme.background
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
-                // Search bar
                 OutlinedTextField(
                     value = query,
                     onValueChange = { query = it },
@@ -113,7 +127,6 @@ fun SearchScreen(
 
                 Spacer(Modifier.height(8.dp))
 
-                // Filter chips
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.fillMaxWidth()
@@ -122,14 +135,17 @@ fun SearchScreen(
                         FilterChip(
                             selected = selectedFilter == filter,
                             onClick = { selectedFilter = filter },
-                            label = { Text(filter.label) }
+                            label = { Text(filter.label) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = NeonGreen.copy(alpha = 0.2f),
+                                selectedLabelColor = NeonGreen
+                            )
                         )
                     }
                 }
 
                 Spacer(Modifier.height(8.dp))
 
-                // Results count
                 if (query.length >= 2) {
                     Text(
                         text = "${searchResults.size} hasil ditemukan",
@@ -144,27 +160,11 @@ fun SearchScreen(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.Center
                     ) {
-                        CircularProgressIndicator()
+                        CircularProgressIndicator(color = NeonGreen)
                         Spacer(Modifier.height(8.dp))
-                        Text("Memuat data dump...")
-                    }
-                } else if (metadata == null) {
-                    Column(
-                        modifier = Modifier.fillMaxSize(),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Center
-                    ) {
-                        Text(
-                            text = "Belum ada data dump.",
-                            style = MaterialTheme.typography.bodyLarge
-                        )
-                        Text(
-                            text = "Jalankan dump terlebih dahulu, lalu buka menu Cari.",
-                            style = MaterialTheme.typography.bodySmall
-                        )
+                        Text("Memuat data dump...", color = NeonGreenDim)
                     }
                 } else {
-                    // Results list
                     LazyColumn(
                         modifier = Modifier.fillMaxSize(),
                         verticalArrangement = Arrangement.spacedBy(4.dp)
@@ -174,6 +174,7 @@ fun SearchScreen(
                                 item = item,
                                 isExpanded = expandedItem == item,
                                 rvaResult = rvaResult,
+                                context = context,
                                 onClick = {
                                     expandedItem = if (expandedItem == item) null else item
                                 }
@@ -185,6 +186,7 @@ fun SearchScreen(
                                 Text(
                                     text = "...dan ${searchResults.size - 500} hasil lainnya",
                                     style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.padding(8.dp)
                                 )
                             }
@@ -201,19 +203,25 @@ private fun SearchResultCard(
     item: SearchResultItem,
     isExpanded: Boolean,
     rvaResult: RvaResult? = null,
+    context: Context,
     onClick: () -> Unit
 ) {
+    val cardColor = when (item.type) {
+        SearchResultType.Class -> DarkCardClass
+        SearchResultType.Method -> DarkCardMethod
+        SearchResultType.Field -> DarkCardField
+    }
+    val tagColor = when (item.type) {
+        SearchResultType.Class -> NeonGreen
+        SearchResultType.Method -> NeonGreenDim
+        SearchResultType.Field -> NeonGreen.copy(alpha = 0.7f)
+    }
+
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick),
-        colors = CardDefaults.cardColors(
-            containerColor = when (item.type) {
-                SearchResultType.Class -> MaterialTheme.colorScheme.primaryContainer
-                SearchResultType.Method -> MaterialTheme.colorScheme.secondaryContainer
-                SearchResultType.Field -> MaterialTheme.colorScheme.tertiaryContainer
-            }
-        )
+        colors = CardDefaults.cardColors(containerColor = cardColor)
     ) {
         Column(modifier = Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -225,13 +233,14 @@ private fun SearchResultCard(
                     },
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.primary
+                    color = tagColor
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(
                     text = item.name,
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -252,18 +261,39 @@ private fun SearchResultCard(
                 Text(
                     text = item.detail,
                     fontFamily = FontFamily.Monospace,
-                    style = MaterialTheme.typography.bodySmall
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface
                 )
                 if (item.type == SearchResultType.Method && rvaResult != null && item.methodIndex >= 0) {
                     val methodRva = rvaResult.methodRvas[item.methodIndex]
                     if (methodRva != null) {
                         Spacer(Modifier.height(4.dp))
-                        Text(
-                            text = "RVA: ${methodRva.hexRva}  Size: ${methodRva.hexSize}",
-                            fontFamily = FontFamily.Monospace,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.primary
-                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = buildAnnotatedString {
+                                    withStyle(SpanStyle(color = NeonGreen, fontFamily = FontFamily.Monospace)) {
+                                        append("RVA: ${methodRva.hexRva}")
+                                    }
+                                    withStyle(SpanStyle(color = MaterialTheme.colorScheme.onSurfaceVariant, fontFamily = FontFamily.Monospace)) {
+                                        append("  Size: ${methodRva.hexSize}")
+                                    }
+                                },
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Spacer(Modifier.weight(1f))
+                            TextButton(
+                                onClick = {
+                                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    clipboard.setPrimaryClip(ClipData.newPlainText("RVA", methodRva.hexRva))
+                                    Toast.makeText(context, "RVA disalin: ${methodRva.hexRva}", Toast.LENGTH_SHORT).show()
+                                }
+                            ) {
+                                Text("Salin", color = NeonGreen, style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
                     }
                 }
             }
@@ -363,12 +393,12 @@ private fun EmptySearchState(isLoading: Boolean, onBack: () -> Unit) {
                 title = { Text("Cari Dump") },
                 modifier = Modifier.statusBarsPadding(),
                 colors = TopAppBarDefaults.smallTopAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    titleContentColor = MaterialTheme.colorScheme.onPrimary
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    titleContentColor = NeonGreen
                 ),
                 navigationIcon = {
                     TextButton(onClick = onBack) {
-                        Text("< Kembali", color = MaterialTheme.colorScheme.onPrimary)
+                        Text("< Kembali", color = NeonGreen)
                     }
                 }
             )
@@ -386,17 +416,19 @@ private fun EmptySearchState(isLoading: Boolean, onBack: () -> Unit) {
                 verticalArrangement = Arrangement.Center
             ) {
                 if (isLoading) {
-                    CircularProgressIndicator()
+                    CircularProgressIndicator(color = NeonGreen)
                     Spacer(Modifier.height(8.dp))
-                    Text("Memuat data dump...")
+                    Text("Memuat data dump...", color = NeonGreenDim)
                 } else {
                     Text(
                         text = "Belum ada data dump.",
-                        style = MaterialTheme.typography.bodyLarge
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
                         text = "Jalankan dump terlebih dahulu, lalu buka menu Cari.",
-                        style = MaterialTheme.typography.bodySmall
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }

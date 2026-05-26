@@ -53,6 +53,9 @@ import com.xuo.il2cppx.settings.DumpSettings
 import com.xuo.il2cppx.ui.SearchScreen
 import com.xuo.il2cppx.ui.SettingsScreen
 import com.xuo.il2cppx.ui.theme.MyComposeApplicationTheme
+import com.xuo.il2cppx.ui.theme.NeonGreen
+import com.xuo.il2cppx.ui.theme.NeonGreenDim
+import com.xuo.il2cppx.ui.theme.DarkCard
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -155,18 +158,17 @@ private fun MainScreen(
     Scaffold(
         topBar = {
             SmallTopAppBar(
-                title = { Text("IL2CPP X") },
+                title = { Text("IL2CPP X", color = NeonGreen) },
                 modifier = Modifier.statusBarsPadding(),
                 colors = TopAppBarDefaults.smallTopAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    titleContentColor = MaterialTheme.colorScheme.onPrimary
+                    containerColor = MaterialTheme.colorScheme.surface
                 ),
                 actions = {
                     TextButton(onClick = onSearchClick) {
-                        Text("Cari", color = MaterialTheme.colorScheme.onPrimary)
+                        Text("Cari", color = NeonGreen)
                     }
                     TextButton(onClick = onSettingsClick) {
-                        Text("Settings", color = MaterialTheme.colorScheme.onPrimary)
+                        Text("Settings", color = NeonGreen)
                     }
                 }
             )
@@ -188,11 +190,13 @@ private fun MainScreen(
                 Text(
                     text = "IL2CPP Dumper",
                     style = MaterialTheme.typography.headlineSmall,
-                    fontWeight = FontWeight.Bold
+                    fontWeight = FontWeight.Bold,
+                    color = NeonGreen
                 )
                 Text(
                     text = "Workflow lokal untuk memilih file Unity IL2CPP dan menyiapkan proses dump secara aman.",
-                    style = MaterialTheme.typography.bodyMedium
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
                 ModeSelector(
@@ -226,13 +230,20 @@ private fun MainScreen(
 
                 // Progress indicator
                 AnimatedVisibility(visible = isDumping) {
-                    Card(modifier = Modifier.fillMaxWidth()) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = androidx.compose.material3.CardDefaults.cardColors(
+                            containerColor = DarkCard
+                        )
+                    ) {
                         Column(modifier = Modifier.padding(16.dp)) {
-                            Text(progressPhase, fontWeight = FontWeight.Bold)
+                            Text(progressPhase, fontWeight = FontWeight.Bold, color = NeonGreen)
                             Spacer(Modifier.height(8.dp))
                             LinearProgressIndicator(
                                 progress = progressValue,
-                                modifier = Modifier.fillMaxWidth()
+                                modifier = Modifier.fillMaxWidth(),
+                                color = NeonGreen,
+                                trackColor = NeonGreen.copy(alpha = 0.15f)
                             )
                             Spacer(Modifier.height(4.dp))
                             Row(
@@ -327,12 +338,17 @@ private fun ModeSelector(
     selectedMode: DumpMode,
     onModeSelected: (DumpMode) -> Unit
 ) {
-    Card(modifier = Modifier.fillMaxWidth()) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = androidx.compose.material3.CardDefaults.cardColors(
+            containerColor = DarkCard
+        )
+    ) {
         Column(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text("Mode engine", fontWeight = FontWeight.Bold)
+            Text("Mode engine", fontWeight = FontWeight.Bold, color = NeonGreen)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 DumpMode.values().forEach { mode ->
                     val isSelected = selectedMode == mode
@@ -358,12 +374,17 @@ private fun ZygiskCard(
     packageName: String,
     onPackageNameChange: (String) -> Unit
 ) {
-    Card(modifier = Modifier.fillMaxWidth()) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = androidx.compose.material3.CardDefaults.cardColors(
+            containerColor = DarkCard
+        )
+    ) {
         Column(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text("Zygisk companion", fontWeight = FontWeight.Bold)
+            Text("Zygisk companion", fontWeight = FontWeight.Bold, color = NeonGreen)
             OutlinedTextField(
                 value = packageName,
                 onValueChange = onPackageNameChange,
@@ -387,13 +408,18 @@ private fun FilePickerCard(
     buttonText: String,
     onClick: () -> Unit
 ) {
-    Card(modifier = Modifier.fillMaxWidth()) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = androidx.compose.material3.CardDefaults.cardColors(
+            containerColor = DarkCard
+        )
+    ) {
         Column(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text(title, fontWeight = FontWeight.Bold)
-            Text(fileName, style = MaterialTheme.typography.bodySmall)
+            Text(title, fontWeight = FontWeight.Bold, color = NeonGreen)
+            Text(fileName, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Button(onClick = onClick) {
                 Text(buttonText)
             }
@@ -403,14 +429,20 @@ private fun FilePickerCard(
 
 @Composable
 private fun LogCard(text: String) {
-    Card(modifier = Modifier.fillMaxWidth()) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = androidx.compose.material3.CardDefaults.cardColors(
+            containerColor = DarkCard
+        )
+    ) {
         Column(modifier = Modifier.padding(16.dp)) {
-            Text("Log", fontWeight = FontWeight.Bold)
+            Text("Log", fontWeight = FontWeight.Bold, color = NeonGreen)
             Spacer(Modifier.height(8.dp))
             Text(
                 text = text,
                 fontFamily = FontFamily.Monospace,
-                style = MaterialTheme.typography.bodySmall
+                style = MaterialTheme.typography.bodySmall,
+                color = NeonGreenDim
             )
         }
     }

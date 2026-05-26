@@ -36,6 +36,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.xuo.il2cppx.settings.DumpSettings
 import com.xuo.il2cppx.settings.OutputFormat
+import com.xuo.il2cppx.ui.theme.NeonGreen
+import com.xuo.il2cppx.ui.theme.DarkCard
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -54,15 +56,14 @@ fun SettingsScreen(
     Scaffold(
         topBar = {
             SmallTopAppBar(
-                title = { Text("Pengaturan") },
+                title = { Text("Pengaturan", color = NeonGreen) },
                 modifier = Modifier.statusBarsPadding(),
                 colors = TopAppBarDefaults.smallTopAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    titleContentColor = MaterialTheme.colorScheme.onPrimary
+                    containerColor = MaterialTheme.colorScheme.surface
                 ),
                 navigationIcon = {
                     TextButton(onClick = onBack) {
-                        Text("< Kembali", color = MaterialTheme.colorScheme.onPrimary)
+                        Text("< Kembali", color = NeonGreen)
                     }
                 }
             )
@@ -80,9 +81,12 @@ fun SettingsScreen(
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
                 // Output directory
-                Card(modifier = Modifier.fillMaxWidth()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = androidx.compose.material3.CardDefaults.cardColors(containerColor = DarkCard)
+                ) {
                     Column(modifier = Modifier.padding(16.dp)) {
-                        Text("Direktori Output", fontWeight = FontWeight.Bold)
+                        Text("Direktori Output", fontWeight = FontWeight.Bold, color = NeonGreen)
                         Spacer(Modifier.height(8.dp))
                         OutlinedTextField(
                             value = outputDir,
@@ -100,9 +104,12 @@ fun SettingsScreen(
                 }
 
                 // Output formats
-                Card(modifier = Modifier.fillMaxWidth()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = androidx.compose.material3.CardDefaults.cardColors(containerColor = DarkCard)
+                ) {
                     Column(modifier = Modifier.padding(16.dp)) {
-                        Text("Format Output", fontWeight = FontWeight.Bold)
+                        Text("Format Output", fontWeight = FontWeight.Bold, color = NeonGreen)
                         Spacer(Modifier.height(8.dp))
                         OutputFormat.values().forEach { format ->
                             Row(
@@ -126,9 +133,12 @@ fun SettingsScreen(
                 }
 
                 // String literals limit
-                Card(modifier = Modifier.fillMaxWidth()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = androidx.compose.material3.CardDefaults.cardColors(containerColor = DarkCard)
+                ) {
                     Column(modifier = Modifier.padding(16.dp)) {
-                        Text("Batas String Literal", fontWeight = FontWeight.Bold)
+                        Text("Batas String Literal", fontWeight = FontWeight.Bold, color = NeonGreen)
                         Spacer(Modifier.height(8.dp))
                         OutlinedTextField(
                             value = maxStringLiterals.toString(),
@@ -142,9 +152,12 @@ fun SettingsScreen(
                 }
 
                 // Dump options
-                Card(modifier = Modifier.fillMaxWidth()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = androidx.compose.material3.CardDefaults.cardColors(containerColor = DarkCard)
+                ) {
                     Column(modifier = Modifier.padding(16.dp)) {
-                        Text("Opsi Dump", fontWeight = FontWeight.Bold)
+                        Text("Opsi Dump", fontWeight = FontWeight.Bold, color = NeonGreen)
                         Spacer(Modifier.height(8.dp))
                         CheckboxRow("Sertakan info RVA", includeRva) { includeRva = it }
                         CheckboxRow("Sertakan inheritance", includeInheritance) { includeInheritance = it }
