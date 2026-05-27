@@ -132,6 +132,23 @@ impl DumpCsWriter {
 
         // types_array_va points to array of Il2CppType* pointers
         let types_ptr_array_foff = elf_info.vaddr_to_file_offset(types_array_va)? as usize;
+        debug_log.push(format!("types_array_va=0x{:x} foff=0x{:x} count={}", types_array_va, types_ptr_array_foff, types_count));
+        // Log first few pointers from the array
+        for dbg_i in 0..std::cmp::min(types_count, 3) {
+            let dbg_off = types_ptr_array_foff + dbg_i * ptr_size;
+            if dbg_off + ptr_size <= bytes.len() {
+                let dbg_ptr = if is_64 {
+                    crate::rva_resolver::read_u64(bytes, dbg_off, is_le)
+                } else {
+                    crate::rva_resolver::read_u32(bytes, dbg_off, is_le) as u64
+                };
+                let dbg_foff = elf_info.vaddr_to_file_offset(dbg_ptr).map(|o| o as usize);
+                let dbg_kind = dbg_foff.and_then(|o| {
+                    if o + type_kind_offset + 1 <= bytes.len() { Some(bytes[o + type_kind_offset]) } else { None }
+                });
+                debug_log.push(format!("  type[{}]: ptr=0x{:x} foff={:?} kind={:?}", dbg_i, dbg_ptr, dbg_foff, dbg_kind));
+            }
+        }
 
         let mut map = std::collections::HashMap::new();
         // TypeDef index → name (for resolving CLASS/VALUETYPE data)
@@ -226,6 +243,17 @@ impl DumpCsWriter {
             if let Some(n) = name {
                 map.insert(i, n);
             }
+        }
+
+        debug_log.push(format!("Il2CppType resolved: {} types (of {} in array)", map.len(), types_count));
+        // Log some sample resolved entries
+        let mut sample_keys: Vec<usize> = map.keys().copied().collect();
+        sample_keys.sort();
+        for &k in sample_keys.iter().take(5) {
+            debug_log.push(format!("  type[{}] = {}", k, map.get(&k).unwrap()));
+        }
+        if sample_keys.len() > 5 {
+            debug_log.push(format!("  ... max key = {}", sample_keys.last().unwrap()));
         }
 
         Some(map)
