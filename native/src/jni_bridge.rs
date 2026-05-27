@@ -50,6 +50,12 @@ pub fn dump_native(
         if elf_info.is_little_endian { "LE" } else { "BE" },
         elf_info.symbols.len()));
     log_lines.push(format!("metadata version: {}", metadata.version));
+
+    // Add stride detection debug logs
+    for slog in crate::metadata_parser::take_stride_logs() {
+        log_lines.push(slog);
+    }
+
     log_lines.push(format!("RVA resolved: {}/{} methods ({}%)",
         rva_result.resolved_count(), rva_result.total_methods,
         (rva_result.resolution_rate() * 100.0) as u32));

@@ -1,6 +1,17 @@
 use crate::binary_reader::BinaryReader;
 use crate::metadata_models::*;
 
+use std::cell::RefCell;
+
+thread_local! {
+    static STRIDE_LOGS: RefCell<Vec<String>> = RefCell::new(Vec::new());
+}
+
+/// Get and clear stride detection logs.
+pub fn take_stride_logs() -> Vec<String> {
+    STRIDE_LOGS.with(|logs| logs.borrow_mut().drain(..).collect())
+}
+
 const METADATA_MAGIC: u32 = 0xFAB11BAF;
 const HEADER_MIN_SIZE: usize = 16;
 const STRING_LITERAL_ENTRY_SIZE: usize = 8;
@@ -131,32 +142,27 @@ fn detect_stride(
         // Unique names are important — with wrong stride, consecutive entries share nameIndex
         let mut score = valid * 2 + unique_names.len() as i32;
 
-        // For field/parameter tables: validate type_index at the correct offset.
-        // stride 8:  typeIndex at +4
-        // stride 12+: typeIndex at +8 (token field at +4)
-        // If the typeIndex offset produces valid-looking type indices, boost the score.
-        if let Some(tr) = type_range {
-            if tr.size > 0 {
-                // type_index is a sequential index into the types array.
-                // Use a generous upper bound based on the type table size.
-                // The actual type count = tr.size / type_def_size, but we don't know
-                // type_def_size here. Use tr.size / 64 (min stride) as upper bound.
-                let max_type_idx = tr.size / 64;
-                let ti_offset = if stride >= 12 { 8 } else { 4 };
-                if ti_offset + 4 <= stride {
-                    let mut ti_valid = 0i32;
-                    for i in 0..sample {
-                        let offset = table_range.offset + i * stride;
-                        if offset + ti_offset + 4 > reader.size() {
-                            break;
-                        }
-                        let ti = reader.read_i32_le(offset + ti_offset).unwrap_or(-1);
-                        if ti >= 0 && (ti as usize) < max_type_idx {
-                            ti_valid += 1;
-                        }
-                    }
-                    score += ti_valid;
+        // For field/parameter tables: validate that the bytes look like actual
+        // [nameIndex, typeIndex] and NOT [token, typeIndex].
+        // Token values (0x04XXXXXX for fields, 0x08XXXXXX for params) would be
+        // read as nameIndex with wrong stride, but they fail string validation.
+        // If nameIndex values are actually tokens, valid count would be low.
+        // Penalize strides where nameIndex looks like a metadata token.
+        if (table_name == "fields" || table_name == "parameters") && stride >= 12 {
+            let token_prefix: i32 = if table_name == "fields" { 0x04 } else { 0x08 };
+            let mut token_count = 0i32;
+            for i in 0..sample {
+                let offset = table_range.offset + i * stride;
+                if offset + 4 > reader.size() { break; }
+                let val = reader.read_i32_le(offset).unwrap_or(0);
+                // Check if value looks like a metadata token (0x0X000000 range)
+                if (val >> 24) == token_prefix && (val & 0x00FFFFFF) > 0 {
+                    token_count += 1;
                 }
+            }
+            if token_count > sample as i32 / 2 {
+                // Most "nameIndex" values are tokens — wrong stride, penalize heavily
+                score -= token_count * 3;
             }
         }
 
@@ -165,6 +171,14 @@ fn detect_stride(
             best_stride = stride;
         }
     }
+
+    // Store detection result in a global log for debugging
+    STRIDE_LOGS.with(|logs| {
+        logs.borrow_mut().push(format!(
+            "[stride-detect] table={} => stride={} score={}",
+            table_name, best_stride, best_score
+        ));
+    });
 
     best_stride
 }

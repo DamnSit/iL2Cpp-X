@@ -90,6 +90,11 @@ pub fn dump(
     log.push(format!("methods: {}", metadata.methods.len()));
     log.push(format!("parameters: {}", metadata.parameters.len()));
 
+    // Add stride detection debug logs
+    for slog in metadata_parser::take_stride_logs() {
+        log.push(slog);
+    }
+
     // Parse ELF
     let elf_info = match ElfParser::new().parse_file(lib_path) {
         Ok(e) => e,
