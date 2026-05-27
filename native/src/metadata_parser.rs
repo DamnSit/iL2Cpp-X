@@ -422,14 +422,11 @@ impl MetadataParser {
                 (8, 12, 32, 24, 26, 28)
             };
 
-        // ParameterDef type_index offset:
+        // ParameterDef type_index is always at +4:
         // stride 8:  nameIndex(+0), typeIndex(+4)
-        // stride 12: nameIndex(+0), token(+4), typeIndex(+8)
-        // stride 16: nameIndex(+0), token(+4), typeIndex(+8), extra(+12)
-        let param_type_index = match param_def_size {
-            8 => 4,
-            _ => 8, // 12 and 16 both have typeIndex at +8
-        };
+        // stride 12: nameIndex(+0), typeIndex(+4), token(+8)
+        // stride 16: nameIndex(+0), typeIndex(+4), token(+8), extra(+12)
+        let param_type_index = 4;
 
         let config = VersionConfig {
             type_def_size,
@@ -858,11 +855,11 @@ fn read_fields(reader: &BinaryReader, ranges: &[MetadataRange], config: &Version
         Some(r) => r,
         None => return Vec::new(),
     };
-    // typeIndex offset depends on stride:
+    // typeIndex is always at +4:
     // stride 8:  nameIndex(+0), typeIndex(+4)
-    // stride 12: nameIndex(+0), token(+4), typeIndex(+8)
-    // stride 16: nameIndex(+0), token(+4), typeIndex(+8), extra(+12)
-    let type_index_offset = if config.field_def_size >= 12 { 8 } else { 4 };
+    // stride 12: nameIndex(+0), typeIndex(+4), token(+8)
+    // stride 16: nameIndex(+0), typeIndex(+4), token(+8), extra(+12)
+    let type_index_offset = 4;
     let count = field_range.size / config.field_def_size;
     let mut fields = Vec::with_capacity(count);
     for index in 0..count {
