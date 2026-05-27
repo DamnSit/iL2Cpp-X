@@ -77,8 +77,15 @@ impl DumpCsWriter {
         // TypeDef index is i32 at data union offset +0
         let data_offset = 0usize;
 
-        // Look for g_MetadataRegistration symbol
-        let meta_reg_addr = elf_info.find_symbol("g_MetadataRegistration").map(|s| s.value);
+        // Apply relocations — pointers in .data.rel.ro need R_AARCH64_RELATIVE
+        // relocations applied before they contain valid virtual addresses.
+        let patched_bytes = crate::rva_resolver::apply_relocations(lib_bytes, elf_info);
+        let bytes = &patched_bytes;
+
+        // Look for g_MetadataRegistration symbol (try alternate names too)
+        let meta_reg_addr = elf_info.find_symbol("g_MetadataRegistration")
+            .or_else(|| elf_info.find_symbol("g_MetadataRegistrationPtr"))
+            .map(|s| s.value);
         debug_log.push(format!("g_MetadataRegistration: {:?}", meta_reg_addr));
 
         let (types_array_va, types_count) = if let Some(addr) = meta_reg_addr {
@@ -90,19 +97,28 @@ impl DumpCsWriter {
                 }
             };
             debug_log.push(format!("MetadataReg struct at file offset 0x{:x}", foff));
-            match Self::find_types_in_metadata_reg(lib_bytes, foff, elf_info, metadata, is_le, ptr_size) {
+            match Self::find_types_in_metadata_reg(bytes, foff, elf_info, metadata, is_le, ptr_size) {
                 Some(r) => {
                     debug_log.push(format!("find_types_in_metadata_reg: va=0x{:x} count={}", r.0, r.1));
                     r
                 }
                 None => {
-                    debug_log.push("find_types_in_metadata_reg returned None".to_string());
-                    return None;
+                    debug_log.push("find_types_in_metadata_reg returned None, trying scan".to_string());
+                    match Self::find_types_by_scan(bytes, elf_info, metadata, is_le, ptr_size) {
+                        Some(r) => {
+                            debug_log.push(format!("find_types_by_scan: va=0x{:x} count={}", r.0, r.1));
+                            r
+                        }
+                        None => {
+                            debug_log.push("find_types_by_scan also returned None".to_string());
+                            return None;
+                        }
+                    }
                 }
             }
         } else {
-            debug_log.push("No g_MetadataRegistration symbol, scanning .data.rel.ro".to_string());
-            match Self::find_types_by_scan(lib_bytes, elf_info, metadata, is_le, ptr_size) {
+            debug_log.push("No g_MetadataRegistration symbol, scanning data segments".to_string());
+            match Self::find_types_by_scan(bytes, elf_info, metadata, is_le, ptr_size) {
                 Some(r) => {
                     debug_log.push(format!("find_types_by_scan: va=0x{:x} count={}", r.0, r.1));
                     r
@@ -141,13 +157,13 @@ impl DumpCsWriter {
         for i in 0..types_count {
             // Read the pointer from the array
             let ptr_entry_off = types_ptr_array_foff + i * ptr_size;
-            if ptr_entry_off + ptr_size > lib_bytes.len() {
+            if ptr_entry_off + ptr_size > bytes.len() {
                 break;
             }
             let type_struct_va = if is_64 {
-                crate::rva_resolver::read_u64(lib_bytes, ptr_entry_off, is_le)
+                crate::rva_resolver::read_u64(bytes, ptr_entry_off, is_le)
             } else {
-                crate::rva_resolver::read_u32(lib_bytes, ptr_entry_off, is_le) as u64
+                crate::rva_resolver::read_u32(bytes, ptr_entry_off, is_le) as u64
             };
             if type_struct_va == 0 {
                 continue;
@@ -156,17 +172,17 @@ impl DumpCsWriter {
                 Some(o) => o as usize,
                 None => continue,
             };
-            if type_foff + ptr_size + 4 > lib_bytes.len() {
+            if type_foff + ptr_size + 4 > bytes.len() {
                 continue;
             }
 
             // Read type kind from bitfield
-            let type_kind = lib_bytes[type_foff + type_kind_offset];
+            let type_kind = bytes[type_foff + type_kind_offset];
             // Read data from union at offset +0
             let type_data = if is_64 {
-                crate::rva_resolver::read_u64(lib_bytes, type_foff + data_offset, is_le) as usize
+                crate::rva_resolver::read_u64(bytes, type_foff + data_offset, is_le) as usize
             } else {
-                crate::rva_resolver::read_u32(lib_bytes, type_foff + data_offset, is_le) as usize
+                crate::rva_resolver::read_u32(bytes, type_foff + data_offset, is_le) as usize
             };
 
             let name = match type_kind {
@@ -181,21 +197,21 @@ impl DumpCsWriter {
                 // PTR(0x12) — data = Il2CppType*
                 0x12 => {
                     let inner = Self::resolve_type_from_ptr(
-                        lib_bytes, elf_info, type_data, type_kind_offset, data_offset, &td_names, is_64, is_le, ptr_size
+                        bytes, elf_info, type_data, type_kind_offset, data_offset, &td_names, is_64, is_le, ptr_size
                     );
                     Some(format!("{}*", inner))
                 }
                 // SZARRAY(0x14) — data = Il2CppType*
                 0x14 => {
                     let inner = Self::resolve_type_from_ptr(
-                        lib_bytes, elf_info, type_data, type_kind_offset, data_offset, &td_names, is_64, is_le, ptr_size
+                        bytes, elf_info, type_data, type_kind_offset, data_offset, &td_names, is_64, is_le, ptr_size
                     );
                     Some(format!("{}[]", inner))
                 }
                 // ARRAY(0x15) — data = Il2CppArrayType*
                 0x15 => {
                     let inner = Self::resolve_type_from_ptr(
-                        lib_bytes, elf_info, type_data, type_kind_offset, data_offset, &td_names, is_64, is_le, ptr_size
+                        bytes, elf_info, type_data, type_kind_offset, data_offset, &td_names, is_64, is_le, ptr_size
                     );
                     Some(format!("{}[...]", inner))
                 }
@@ -279,6 +295,7 @@ impl DumpCsWriter {
     }
 
     /// Find the types array pointer and count in the Il2CppMetadataRegistration struct.
+    /// Uses known struct offsets first, then falls back to heuristic scan.
     fn find_types_in_metadata_reg(
         lib_bytes: &[u8],
         struct_foff: usize,
@@ -288,35 +305,75 @@ impl DumpCsWriter {
         ptr_size: usize,
     ) -> Option<(u64, usize)> {
         let expected_count = metadata.types.len();
-        let struct_size = if elf_info.is_64bit { 128 } else { 64 };
+        let struct_size = if elf_info.is_64bit { 256 } else { 128 };
         let end = (struct_foff + struct_size).min(lib_bytes.len());
 
-        // Scan struct for (count, pointer) pairs
+        // Try known offsets for Il2CppMetadataRegistration.types / typesCount
+        // Layout varies by version, try common offsets:
+        // 64-bit: types at +48, typesCount at +56 (v29-v31)
+        // 32-bit: types at +24, typesCount at +28
+        let known_offsets: &[(usize, usize)] = if elf_info.is_64bit {
+            &[(56, 48), (48, 56), (40, 32), (32, 40)]  // (count_off, ptr_off)
+        } else {
+            &[(28, 24), (24, 28), (20, 16), (16, 20)]
+        };
+
+        for &(count_off, ptr_off) in known_offsets {
+            if struct_foff + count_off + ptr_size > lib_bytes.len() { continue; }
+            if struct_foff + ptr_off + ptr_size > lib_bytes.len() { continue; }
+
+            let count = if elf_info.is_64bit {
+                crate::rva_resolver::read_u64(lib_bytes, struct_foff + count_off, is_le) as usize
+            } else {
+                crate::rva_resolver::read_u32(lib_bytes, struct_foff + count_off, is_le) as usize
+            };
+            let ptr = if elf_info.is_64bit {
+                crate::rva_resolver::read_u64(lib_bytes, struct_foff + ptr_off, is_le)
+            } else {
+                crate::rva_resolver::read_u32(lib_bytes, struct_foff + ptr_off, is_le) as u64
+            };
+
+            if count > 0 && count < expected_count * 2 && count > expected_count / 2
+                && ptr > 0x10000 && elf_info.vaddr_to_file_offset(ptr).is_some()
+            {
+                return Some((ptr, count));
+            }
+        }
+
+        // Fallback: scan struct for any (count, pointer) or (pointer, count) pair
         let mut offset = struct_foff;
         while offset + ptr_size * 2 <= end {
-            let count = if elf_info.is_64bit {
+            // Try (count, pointer)
+            let val_a = if elf_info.is_64bit {
                 crate::rva_resolver::read_u64(lib_bytes, offset, is_le) as usize
             } else {
                 crate::rva_resolver::read_u32(lib_bytes, offset, is_le) as usize
             };
-            let ptr = if elf_info.is_64bit {
+            let val_b = if elf_info.is_64bit {
                 crate::rva_resolver::read_u64(lib_bytes, offset + ptr_size, is_le)
             } else {
                 crate::rva_resolver::read_u32(lib_bytes, offset + ptr_size, is_le) as u64
             };
 
-            // Heuristic: count should be close to expected, pointer should be valid VA
-            if count > 0 && count < expected_count * 2 && count > expected_count / 2
-                && ptr > 0x10000 && elf_info.vaddr_to_file_offset(ptr).is_some()
+            // Check (count=a, pointer=b)
+            if val_a > 0 && val_a < expected_count * 2 && val_a > expected_count / 2
+                && val_b > 0x10000 && elf_info.vaddr_to_file_offset(val_b).is_some()
             {
-                return Some((ptr, count));
+                return Some((val_b, val_a));
+            }
+            // Check (pointer=a, count=b)
+            if val_b > 0 && (val_b as usize) < expected_count * 2 && (val_b as usize) > expected_count / 2
+                && val_a > 0x10000 && elf_info.vaddr_to_file_offset(val_a as u64).is_some()
+            {
+                return Some((val_a as u64, val_b as usize));
             }
             offset += ptr_size;
         }
         None
     }
 
-    /// Scan .data.rel.ro for the types array pattern when g_MetadataRegistration symbol is missing.
+    /// Scan all non-executable data segments for the types array pattern.
+    /// Uses known struct offsets and validates by dereferencing the types pointer.
     fn find_types_by_scan(
         lib_bytes: &[u8],
         elf_info: &ElfInfo,
@@ -325,30 +382,92 @@ impl DumpCsWriter {
         ptr_size: usize,
     ) -> Option<(u64, usize)> {
         let expected_count = metadata.types.len();
-        // Find .data.rel.ro section
-        let data_rel_ro = elf_info.sections.iter().find(|s| s.name == ".data.rel.ro")?;
-        let start = elf_info.vaddr_to_file_offset(data_rel_ro.addr)? as usize;
-        let end = (start + data_rel_ro.size as usize).min(lib_bytes.len());
 
-        let mut off = start;
-        while off + ptr_size * 2 <= end {
-            let count = if elf_info.is_64bit {
-                crate::rva_resolver::read_u64(lib_bytes, off, is_le) as usize
-            } else {
-                crate::rva_resolver::read_u32(lib_bytes, off, is_le) as usize
-            };
-            let ptr = if elf_info.is_64bit {
-                crate::rva_resolver::read_u64(lib_bytes, off + ptr_size, is_le)
-            } else {
-                crate::rva_resolver::read_u32(lib_bytes, off + ptr_size, is_le) as u64
-            };
+        // Scan all non-executable load segments (not just .data.rel.ro)
+        let data_segments: Vec<_> = elf_info
+            .load_segments()
+            .into_iter()
+            .filter(|s| (s.flags & 0x1) == 0 && s.filesz > 0)
+            .collect();
 
-            if count > 0 && count < expected_count * 2 && count > expected_count / 2
-                && ptr > 0x10000 && elf_info.vaddr_to_file_offset(ptr).is_some()
-            {
-                return Some((ptr, count));
+        // Known offsets for types/typesCount in Il2CppMetadataRegistration
+        let count_offsets: &[usize] = if elf_info.is_64bit {
+            &[56, 48, 40, 32]
+        } else {
+            &[28, 24, 20, 16]
+        };
+        let ptr_offsets: &[usize] = if elf_info.is_64bit {
+            &[48, 56, 32, 40]
+        } else {
+            &[24, 28, 16, 20]
+        };
+
+        for seg in &data_segments {
+            let seg_start = seg.offset as usize;
+            let seg_end = (seg_start + seg.filesz as usize).min(lib_bytes.len());
+            if seg_end - seg_start < 64 {
+                continue;
             }
-            off += ptr_size;
+
+            let mut pos = seg_start;
+            while pos + 64 <= seg_end {
+                // Try known offset pairs
+                for (&coff, &poff) in count_offsets.iter().zip(ptr_offsets.iter()) {
+                    if pos + coff + ptr_size > lib_bytes.len() || pos + poff + ptr_size > lib_bytes.len() {
+                        continue;
+                    }
+                    let count = if elf_info.is_64bit {
+                        crate::rva_resolver::read_u64(lib_bytes, pos + coff, is_le) as usize
+                    } else {
+                        crate::rva_resolver::read_u32(lib_bytes, pos + coff, is_le) as usize
+                    };
+                    let ptr = if elf_info.is_64bit {
+                        crate::rva_resolver::read_u64(lib_bytes, pos + poff, is_le)
+                    } else {
+                        crate::rva_resolver::read_u32(lib_bytes, pos + poff, is_le) as u64
+                    };
+
+                    if count == 0 || count < expected_count / 2 || count > expected_count * 2 {
+                        continue;
+                    }
+                    if ptr < 0x10000 {
+                        continue;
+                    }
+                    let arr_foff = match elf_info.vaddr_to_file_offset(ptr) {
+                        Some(o) => o as usize,
+                        None => continue,
+                    };
+
+                    // Validate: dereference first few entries and check they point to
+                    // valid Il2CppType structs (type_kind byte should be 1-30)
+                    let check_count = std::cmp::min(count, 5);
+                    let mut valid = 0usize;
+                    for j in 0..check_count {
+                        let entry_off = arr_foff + j * ptr_size;
+                        if entry_off + ptr_size > lib_bytes.len() { break; }
+                        let type_ptr = if elf_info.is_64bit {
+                            crate::rva_resolver::read_u64(lib_bytes, entry_off, is_le)
+                        } else {
+                            crate::rva_resolver::read_u32(lib_bytes, entry_off, is_le) as u64
+                        };
+                        if type_ptr < 0x10000 { continue; }
+                        let type_foff = match elf_info.vaddr_to_file_offset(type_ptr) {
+                            Some(o) => o as usize,
+                            None => continue,
+                        };
+                        let kind_off = if is_le { ptr_size + 2 } else { ptr_size + 1 };
+                        if type_foff + kind_off + 1 > lib_bytes.len() { continue; }
+                        let kind = lib_bytes[type_foff + kind_off];
+                        if kind >= 1 && kind <= 30 {
+                            valid += 1;
+                        }
+                    }
+                    if valid >= 3 {
+                        return Some((ptr, count));
+                    }
+                }
+                pos += ptr_size;
+            }
         }
         None
     }

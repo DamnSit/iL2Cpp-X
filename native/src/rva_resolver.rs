@@ -1468,7 +1468,7 @@ fn read_entry(bytes: &[u8], offset: usize, entry_size: usize, is_le: bool) -> u6
     }
 }
 
-fn read_pointer(bytes: &[u8], offset: usize, pointer_size: usize, is_le: bool) -> u64 {
+pub fn read_pointer(bytes: &[u8], offset: usize, pointer_size: usize, is_le: bool) -> u64 {
     if pointer_size == 8 {
         read_u64(bytes, offset, is_le)
     } else {
@@ -1491,7 +1491,7 @@ fn read_pointer_array(
 /// Apply R_AARCH64_RELATIVE relocations from .rela.dyn to a copy of the binary.
 /// Each RELA entry is 24 bytes: r_offset(8) + r_info(8) + r_addend(8).
 /// For R_AARCH64_RELATIVE (type 0x403), the final value = r_addend.
-fn apply_relocations(lib_bytes: &[u8], elf_info: &ElfInfo) -> Vec<u8> {
+pub fn apply_relocations(lib_bytes: &[u8], elf_info: &ElfInfo) -> Vec<u8> {
     let mut patched = lib_bytes.to_vec();
     let is_le = elf_info.is_little_endian;
 
