@@ -145,25 +145,43 @@ android {
 
 // Rust native library build task
 // Requires: rustup, cargo-ndk (`cargo install cargo-ndk`), Android NDK
-val buildRust by tasks.registering(Exec::class) {
-    workingDir = file("../native")
-    // Use cargo-ndk to build for all Android ABIs
-    commandLine("cargo", "ndk",
-        "-t", "arm64-v8a",
-        "-t", "armeabi-v7a",
-        "-t", "x86_64",
-        "-t", "x86",
-        "-o", file("src/main/jniLibs").absolutePath,
-        "build", "--release")
-    // Don't fail the build if Rust toolchain isn't installed
-    isIgnoreExitValue = true
-    doFirst {
+// Gracefully skips if cargo/cargo-ndk not installed
+val buildRust by tasks.registering {
+    doLast {
+        // Check if cargo-ndk is available
+        val hasCargoNdk = try {
+            exec {
+                commandLine("cargo", "ndk", "--version")
+                isIgnoreExitValue = true
+            }
+            true
+        } catch (_: Exception) {
+            false
+        }
+
+        if (!hasCargoNdk) {
+            println("Rust build skipped: cargo or cargo-ndk not found.")
+            println("  Install Rust: https://rustup.rs")
+            println("  Install cargo-ndk: cargo install cargo-ndk")
+            return@doLast
+        }
+
         println("Building Rust native library for Android...")
+        exec {
+            workingDir = file("../native")
+            commandLine("cargo", "ndk",
+                "-t", "arm64-v8a",
+                "-t", "armeabi-v7a",
+                "-t", "x86_64",
+                "-t", "x86",
+                "-o", file("src/main/jniLibs").absolutePath,
+                "build", "--release")
+        }
+        println("Rust native library built successfully.")
     }
 }
 
 // Wire Rust build as preBuild dependency
-// The task handles missing toolchain gracefully via isIgnoreExitValue
 tasks.named("preBuild") { dependsOn(buildRust) }
 
 tasks.withType<JavaCompile> {
