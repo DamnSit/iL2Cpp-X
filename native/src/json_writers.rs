@@ -39,20 +39,21 @@ pub fn write_summary(metadata: &MetadataParseResult, path: &str) -> std::io::Res
 pub fn write_string_literals(
     metadata: &MetadataParseResult,
     path: &str,
-    _max_count: usize,
+    max_count: usize,
 ) -> std::io::Result<()> {
     let file = std::fs::File::create(path)?;
     let mut w = BufWriter::new(file);
+    let limit = if max_count == 0 { metadata.string_literals.len() } else { max_count.min(metadata.string_literals.len()) };
 
     writeln!(w, "[")?;
-    for (i, lit) in metadata.string_literals.iter().enumerate() {
+    for (i, lit) in metadata.string_literals.iter().take(limit).enumerate() {
         write!(w, "  {{")?;
         write!(w, "\"index\": {}", lit.index)?;
         write!(w, ", \"dataIndex\": {}", lit.data_index)?;
         write!(w, ", \"length\": {}", lit.length)?;
         write!(w, ", \"value\": \"{}\"", json_escape(&lit.value))?;
         write!(w, "}}")?;
-        if i < metadata.string_literals.len() - 1 {
+        if i < limit - 1 {
             write!(w, ",")?;
         }
         writeln!(w)?;

@@ -1438,7 +1438,7 @@ fn map_pointer_table(
 // Utility functions
 // =========================================================================
 
-fn read_u32(bytes: &[u8], offset: usize, is_le: bool) -> u32 {
+pub fn read_u32(bytes: &[u8], offset: usize, is_le: bool) -> u32 {
     let b0 = bytes[offset] as u32;
     let b1 = bytes[offset + 1] as u32;
     let b2 = bytes[offset + 2] as u32;
@@ -1450,7 +1450,7 @@ fn read_u32(bytes: &[u8], offset: usize, is_le: bool) -> u32 {
     }
 }
 
-fn read_u64(bytes: &[u8], offset: usize, is_le: bool) -> u64 {
+pub fn read_u64(bytes: &[u8], offset: usize, is_le: bool) -> u64 {
     let lo = read_u32(bytes, offset, is_le) as u64;
     let hi = read_u32(bytes, offset + 4, is_le) as u64;
     if is_le {

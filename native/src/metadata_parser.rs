@@ -189,43 +189,43 @@ fn detect_type_offsets(
     // Known layouts by version range (from Cpp2IL analysis)
     // (field_start, method_start, property_start, method_count_offset, property_count_offset, field_count_offset)
     // These are the MOST COMMON layouts. We validate them below.
-    let candidates: Vec<(usize, usize, usize, usize, usize, usize)> = match (version, stride) {
-        // v16-v23, stride 64-80
-        (16..=23, _) => vec![
-            (56, 60, 68, 80, 82, 84), // v16-v23 standard
+    let candidates: Vec<(usize, usize, usize, usize, usize, usize)> = match stride {
+        // (field_start, method_start, property_start, method_count_offset, property_count_offset, field_count_offset)
+        64 => vec![
+            (28, 32, 40, 48, 50, 52), // v16-v23 stride 64
         ],
-        // v24-v30, stride 96-112
-        (24..=30, _) => vec![
-            (52, 56, 64, 72, 74, 76), // v24-v30 standard
+        72 => vec![
+            (28, 32, 40, 48, 50, 52), // v16-v23 stride 72
         ],
-        // v31+ with various strides
-        (_, 88) => vec![
-            // Confirmed layout for v31 stride 88:
-            // fieldStart=+32, methodStart=+36, propertyStart=+44
-            // method_count=+64(u16), property_count=+66(u16), field_count=+68(u16)
-            (32, 36, 44, 64, 66, 68), // stride 88 confirmed
+        80 => vec![
+            (28, 32, 40, 56, 58, 60), // v16-v23 stride 80
         ],
-        (_, 96) => vec![
-            (52, 56, 64, 72, 74, 76), // v24-v30 standard
+        88 => vec![
+            (32, 36, 44, 64, 66, 68), // v31 stride 88 confirmed
         ],
-        (_, 104) => vec![
-            (52, 56, 64, 72, 74, 76), // v27-v28 standard
+        96 => vec![
+            (32, 36, 44, 64, 66, 68), // v24-v30
+            (52, 56, 64, 72, 74, 76),
         ],
-        (_, 112) => vec![
-            (52, 56, 64, 72, 74, 76), // v29-v30 standard
+        104 => vec![
+            (52, 56, 64, 72, 74, 76), // v27-v28
         ],
-        (_, 120) => vec![
-            (52, 56, 64, 72, 74, 76), // v31-v32 standard
+        112 => vec![
+            (52, 56, 64, 72, 74, 76), // v29-v30
         ],
-        (_, 128) => vec![
-            (52, 56, 64, 72, 74, 76), // v33-v34 standard
+        120 => vec![
+            (52, 56, 64, 72, 74, 76), // v31-v32
         ],
-        (_, 136) => vec![
-            (52, 56, 64, 72, 74, 76), // v35+ standard
+        128 => vec![
+            (52, 56, 64, 72, 74, 76), // v33-v34
+        ],
+        136 => vec![
+            (52, 56, 64, 72, 74, 76), // v35+
         ],
         _ => vec![
             (52, 56, 64, 72, 74, 76), // default
-            (40, 44, 52, 64, 66, 68), // compact
+            (28, 32, 40, 48, 50, 52), // compact
+            (32, 36, 44, 64, 66, 68),
         ],
     };
 

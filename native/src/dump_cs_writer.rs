@@ -1,5 +1,6 @@
 use std::io::{BufWriter, Write};
 
+use crate::elf_parser::ElfInfo;
 use crate::metadata_models::*;
 use crate::rva_resolver::RvaResult;
 
@@ -17,7 +18,20 @@ impl DumpCsWriter {
     }
 
     /// Build a lookup from type_index -> "Namespace.TypeName" for display.
-    fn build_type_name_map(metadata: &MetadataParseResult) -> std::collections::HashMap<usize, String> {
+    /// If elf_info and lib_bytes are provided, resolves Il2CppType array from the binary
+    /// for accurate type name mapping. Otherwise falls back to TypeDef index mapping.
+    fn build_type_name_map(
+        metadata: &MetadataParseResult,
+        elf_info: Option<&ElfInfo>,
+        lib_bytes: Option<&[u8]>,
+    ) -> std::collections::HashMap<usize, String> {
+        // Try to resolve from Il2CppType array in the ELF binary
+        if let (Some(elf), Some(bytes)) = (elf_info, lib_bytes) {
+            if let Some(map) = Self::resolve_il2cpp_types(elf, bytes, metadata) {
+                return map;
+            }
+        }
+        // Fallback: map TypeDef indices directly
         let mut map = std::collections::HashMap::new();
         for t in &metadata.types {
             let fqcn = if !t.namespace_name.is_empty() {
@@ -30,15 +44,202 @@ impl DumpCsWriter {
         map
     }
 
+    /// Try to resolve Il2CppType array from the ELF binary.
+    /// Each Il2CppType is 4 bytes: [bits: u16, attrs: u16]
+    /// bits 0-3 = type kind, bits 4+ = type-specific data (TypeDef index for class/valuetype)
+    fn resolve_il2cpp_types(
+        elf_info: &ElfInfo,
+        lib_bytes: &[u8],
+        metadata: &MetadataParseResult,
+    ) -> Option<std::collections::HashMap<usize, String>> {
+        let is_le = elf_info.is_little_endian;
+        let ptr_size = if elf_info.is_64bit { 8 } else { 4 };
+
+        // Look for g_MetadataRegistration symbol
+        let meta_reg_addr = elf_info.find_symbol("g_MetadataRegistration").map(|s| s.value);
+
+        let (types_array_va, types_count) = if let Some(addr) = meta_reg_addr {
+            let foff = elf_info.vaddr_to_file_offset(addr)? as usize;
+            // Scan the struct for a (count, pointer) pair where count matches expected
+            Self::find_types_in_metadata_reg(lib_bytes, foff, elf_info, metadata, is_le, ptr_size)?
+        } else {
+            // No symbol — try scanning .data.rel.ro
+            Self::find_types_by_scan(lib_bytes, elf_info, metadata, is_le, ptr_size)?
+        };
+
+        let types_foff = elf_info.vaddr_to_file_offset(types_array_va)? as usize;
+
+        // Parse Il2CppType entries (4 bytes each)
+        let mut map = std::collections::HashMap::new();
+        // Primitive types by kind
+        let primitive_names = [
+            (1u16, "void"), (2, "bool"), (3, "char"), (4, "sbyte"), (5, "byte"),
+            (6, "short"), (7, "ushort"), (8, "int"), (9, "uint"),
+            (10, "long"), (11, "ulong"), (12, "float"), (13, "double"),
+            (14, "string"), (15, "object"), (22, "TypedReference"),
+            (24, "IntPtr"), (25, "UIntPtr"),
+        ];
+
+        for i in 0..types_count {
+            let entry_off = types_foff + i * 4;
+            if entry_off + 4 > lib_bytes.len() {
+                break;
+            }
+            let bits = if is_le {
+                u16::from_le_bytes([lib_bytes[entry_off], lib_bytes[entry_off + 1]])
+            } else {
+                u16::from_be_bytes([lib_bytes[entry_off], lib_bytes[entry_off + 1]])
+            };
+            let type_kind = bits & 0xF;
+            let type_data = (bits >> 4) as usize;
+
+            let name = match type_kind {
+                // Primitives
+                1..=15 | 22 | 24 | 25 => {
+                    primitive_names.iter()
+                        .find(|(k, _)| *k == type_kind)
+                        .map(|(_, n)| n.to_string())
+                }
+                // Class/Valuetype — data >> 4 is TypeDef index
+                0x10 | 0x11 => {
+                    if type_data < metadata.types.len() {
+                        let td = &metadata.types[type_data];
+                        if !td.name.is_empty() {
+                            Some(if td.namespace_name.is_empty() {
+                                td.name.clone()
+                            } else {
+                                format!("{}.{}", td.namespace_name, td.name)
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                // Pointer type
+                0x12 => {
+                    // data is another type index
+                    let inner = map.get(&type_data)
+                        .cloned()
+                        .unwrap_or_else(|| format!("T{}", type_data));
+                    Some(format!("{}*", inner))
+                }
+                // Array type
+                0x14 => {
+                    let inner = map.get(&type_data)
+                        .cloned()
+                        .unwrap_or_else(|| format!("T{}", type_data));
+                    Some(format!("{}[]", inner))
+                }
+                // Generic instance
+                0x19 => Some(format!("T{}", type_data)),
+                _ => None,
+            };
+
+            if let Some(n) = name {
+                map.insert(i, n);
+            }
+        }
+
+        Some(map)
+    }
+
+    /// Find the types array pointer and count in the Il2CppMetadataRegistration struct.
+    fn find_types_in_metadata_reg(
+        lib_bytes: &[u8],
+        struct_foff: usize,
+        elf_info: &ElfInfo,
+        metadata: &MetadataParseResult,
+        is_le: bool,
+        ptr_size: usize,
+    ) -> Option<(u64, usize)> {
+        let expected_count = metadata.types.len();
+        let struct_size = if elf_info.is_64bit { 128 } else { 64 };
+        let end = (struct_foff + struct_size).min(lib_bytes.len());
+
+        // Scan struct for (count, pointer) pairs
+        let mut offset = struct_foff;
+        while offset + ptr_size * 2 <= end {
+            let count = if elf_info.is_64bit {
+                crate::rva_resolver::read_u64(lib_bytes, offset, is_le) as usize
+            } else {
+                crate::rva_resolver::read_u32(lib_bytes, offset, is_le) as usize
+            };
+            let ptr = if elf_info.is_64bit {
+                crate::rva_resolver::read_u64(lib_bytes, offset + ptr_size, is_le)
+            } else {
+                crate::rva_resolver::read_u32(lib_bytes, offset + ptr_size, is_le) as u64
+            };
+
+            // Heuristic: count should be close to expected, pointer should be valid VA
+            if count > 0 && count < expected_count * 2 && count > expected_count / 2
+                && ptr > 0x10000 && elf_info.vaddr_to_file_offset(ptr).is_some()
+            {
+                return Some((ptr, count));
+            }
+            offset += ptr_size;
+        }
+        None
+    }
+
+    /// Scan .data.rel.ro for the types array pattern when g_MetadataRegistration symbol is missing.
+    fn find_types_by_scan(
+        lib_bytes: &[u8],
+        elf_info: &ElfInfo,
+        metadata: &MetadataParseResult,
+        is_le: bool,
+        ptr_size: usize,
+    ) -> Option<(u64, usize)> {
+        let expected_count = metadata.types.len();
+        // Find .data.rel.ro section
+        let data_rel_ro = elf_info.sections.iter().find(|s| s.name == ".data.rel.ro")?;
+        let start = elf_info.vaddr_to_file_offset(data_rel_ro.addr)? as usize;
+        let end = (start + data_rel_ro.size as usize).min(lib_bytes.len());
+
+        let mut off = start;
+        while off + ptr_size * 2 <= end {
+            let count = if elf_info.is_64bit {
+                crate::rva_resolver::read_u64(lib_bytes, off, is_le) as usize
+            } else {
+                crate::rva_resolver::read_u32(lib_bytes, off, is_le) as usize
+            };
+            let ptr = if elf_info.is_64bit {
+                crate::rva_resolver::read_u64(lib_bytes, off + ptr_size, is_le)
+            } else {
+                crate::rva_resolver::read_u32(lib_bytes, off + ptr_size, is_le) as u64
+            };
+
+            if count > 0 && count < expected_count * 2 && count > expected_count / 2
+                && ptr > 0x10000 && elf_info.vaddr_to_file_offset(ptr).is_some()
+            {
+                return Some((ptr, count));
+            }
+            off += ptr_size;
+        }
+        None
+    }
+
     pub fn write(
         &self,
         metadata: &MetadataParseResult,
         output_path: &str,
         rva_result: &RvaResult,
     ) -> std::io::Result<usize> {
+        self.write_with_elf(metadata, output_path, rva_result, None, None)
+    }
+
+    pub fn write_with_elf(
+        &self,
+        metadata: &MetadataParseResult,
+        output_path: &str,
+        rva_result: &RvaResult,
+        elf_info: Option<&ElfInfo>,
+        lib_bytes: Option<&[u8]>,
+    ) -> std::io::Result<usize> {
         let file = std::fs::File::create(output_path)?;
         let mut w = BufWriter::new(file);
-        let type_names = Self::build_type_name_map(metadata);
+        let type_names = Self::build_type_name_map(metadata, elf_info, lib_bytes);
 
         writeln!(w, "// Generated by IL2CPP X Rust metadata dumper")?;
         writeln!(w, "// Metadata version: {}", metadata.version)?;

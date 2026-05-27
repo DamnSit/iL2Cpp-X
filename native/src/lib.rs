@@ -1,6 +1,7 @@
 mod binary_reader;
 mod dump_cs_writer;
 mod elf_parser;
+mod jni_bridge;
 mod json_writers;
 mod metadata_models;
 pub mod metadata_parser;
@@ -210,7 +211,7 @@ pub fn dump(
         include_rva_info,
         include_inheritance,
     };
-    match writer.write(&metadata, &dump_cs_path, &rva_result) {
+    match writer.write_with_elf(&metadata, &dump_cs_path, &rva_result, Some(&elf_info), Some(&lib_bytes)) {
         Ok(count) => {
             log.push(format!("dump.cs types written: {}", count));
             log.push(format!("wrote: {}", dump_cs_path));
@@ -246,36 +247,3 @@ pub struct DumpResult {
     pub rva_total: usize,
 }
 
-// =========================================================================
-// JNI Bridge — for calling from Kotlin/Android
-// =========================================================================
-//
-// JNI bridge will be added when building for Android target.
-// For now, the library exposes `dump()` as a normal Rust function.
-// To add JNI support, add `jni = "0.21" to Cargo.toml and uncomment:
-//
-// #[cfg(target_os = "android")]
-// mod jni_bridge {
-//     use super::*;
-//     use jni::JNIEnv;
-//     use jni::objects::{JClass, JString};
-//     use jni::sys::jstring;
-//
-//     #[no_mangle]
-//     pub extern "system" fn Java_com_xuo_il2cppx_engine_NativeDumper_dump(
-//         mut env: JNIEnv,
-//         _class: JClass,
-//         lib_path: JString,
-//         metadata_path: JString,
-//         output_dir: JString,
-//     ) -> jstring {
-//         let lib: String = env.get_string(&lib_path).unwrap().into();
-//         let meta: String = env.get_string(&metadata_path).unwrap().into();
-//         let out: String = env.get_string(&output_dir).unwrap().into();
-//
-//         let result = dump(&lib, &meta, &out, true, true, true, 10000);
-//
-//         let log_text = result.log.join("\n");
-//         env.new_string(&log_text).unwrap().into_raw()
-//     }
-// }

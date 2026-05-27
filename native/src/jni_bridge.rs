@@ -67,7 +67,7 @@ pub fn dump_native(
 
     // Write string literals
     let sl_path = format!("{}/stringliteral.json", output_dir);
-    let _ = json_writers::write_string_literals(&metadata, &sl_path);
+    let _ = json_writers::write_string_literals(&metadata, &sl_path, 10000);
 
     // Write dump.cs
     let dump_cs_path = format!("{}/dump.cs", output_dir);
