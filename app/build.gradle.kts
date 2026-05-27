@@ -30,11 +30,17 @@ val hasValidSigningProps = keystorePropsFile.exists().also { exists ->
 
 
 android {
-    namespace = "com.xuo.il2cppx"  
-    compileSdk = 36    
+    namespace = "com.xuo.il2cppx"
+    compileSdk = 36
     // disable linter
     lint {
         checkReleaseBuilds = false
+    }
+
+    sourceSets {
+        getByName("main") {
+            jniLibs.srcDirs("src/main/jniLibs")
+        }
     }
         
     signingConfigs {
@@ -136,6 +142,38 @@ android {
         }
     }
 }
+
+// Rust native library build task
+// Requires: rustup, cargo-ndk (`cargo install cargo-ndk`), Android NDK
+val buildRust by tasks.registering(Exec::class) {
+    workingDir = file("../native")
+    // Use cargo-ndk to build for all Android ABIs
+    commandLine("cargo", "ndk",
+        "-t", "arm64-v8a",
+        "-t", "armeabi-v7a",
+        "-t", "x86_64",
+        "-t", "x86",
+        "-o", file("src/main/jniLibs").absolutePath,
+        "build", "--release")
+    // Don't fail the build if Rust toolchain isn't installed
+    isIgnoreExitValue = true
+    doFirst {
+        println("Building Rust native library for Android...")
+    }
+    doLast {
+        if (execResult.exitValue == 0) {
+            println("Rust native library built successfully")
+        } else {
+            println("WARNING: Rust build skipped (exit code ${execResult.exitValue}).")
+            println("Install cargo-ndk: cargo install cargo-ndk")
+            println("Add targets: rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android")
+        }
+    }
+}
+
+// Wire Rust build as preBuild dependency
+// The task handles missing toolchain gracefully via isIgnoreExitValue
+tasks.named("preBuild") { dependsOn(buildRust) }
 
 tasks.withType<JavaCompile> {
     options.compilerArgs.add("-Xlint:deprecation")
