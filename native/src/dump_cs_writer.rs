@@ -136,10 +136,12 @@ impl DumpCsWriter {
 
         // Determine actual array size by scanning for the highest valid pointer.
         // typesCount from the struct might be wrong — scan up to a reasonable limit.
-        let max_scan = std::cmp::min(types_count * 3, 200000);
+        // Don't stop on consecutive nulls — there might be gaps in the array.
+        let max_scan_limit = bytes.len().saturating_sub(types_ptr_array_foff) / ptr_size;
+        let max_scan = std::cmp::min(max_scan_limit, 200000);
         let mut actual_count = 0usize;
         let mut max_valid_index = 0usize;
-        let mut consecutive_nulls = 0usize;
+        let mut valid_total = 0usize;
         for i in 0..max_scan {
             let off = types_ptr_array_foff + i * ptr_size;
             if off + ptr_size > bytes.len() { break; }
@@ -148,19 +150,34 @@ impl DumpCsWriter {
             } else {
                 crate::rva_resolver::read_u32(bytes, off, is_le) as u64
             };
-            if ptr == 0 {
-                consecutive_nulls += 1;
-                if consecutive_nulls > 100 { break; }
-                continue;
-            }
-            consecutive_nulls = 0;
+            if ptr == 0 { continue; }
             if elf_info.vaddr_to_file_offset(ptr).is_some() {
                 actual_count = i + 1;
                 max_valid_index = i;
+                valid_total += 1;
             }
         }
         let effective_count = actual_count;
-        debug_log.push(format!("types array scan: effective_count={} max_valid_index={}", effective_count, max_valid_index));
+        debug_log.push(format!("types array scan: effective_count={} max_valid_index={} valid_entries={}", effective_count, max_valid_index, valid_total));
+
+        // Debug: check specific high indices from field type_index values
+        for &dbg_i in &[29843, 31395, 35140] {
+            let dbg_off = types_ptr_array_foff + dbg_i * ptr_size;
+            if dbg_off + ptr_size <= bytes.len() {
+                let dbg_ptr = if is_64 {
+                    crate::rva_resolver::read_u64(bytes, dbg_off, is_le)
+                } else {
+                    crate::rva_resolver::read_u32(bytes, dbg_off, is_le) as u64
+                };
+                let dbg_foff = elf_info.vaddr_to_file_offset(dbg_ptr).map(|o| o as usize);
+                let dbg_kind = dbg_foff.and_then(|o| {
+                    if o + type_kind_offset + 1 <= bytes.len() { Some(bytes[o + type_kind_offset]) } else { None }
+                });
+                debug_log.push(format!("  CHECK type[{}]: ptr=0x{:x} foff={:?} kind={:?}", dbg_i, dbg_ptr, dbg_foff, dbg_kind));
+            } else {
+                debug_log.push(format!("  CHECK type[{}]: OUT OF BOUNDS (off=0x{:x} len=0x{:x})", dbg_i, dbg_off, bytes.len()));
+            }
+        }
 
         // Log first few pointers from the array
         for dbg_i in 0..std::cmp::min(effective_count, 3) {
