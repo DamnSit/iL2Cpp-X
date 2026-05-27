@@ -123,7 +123,8 @@ class Il2CppNativeDumper {
         if (OutputFormat.DumpCs in formats) {
             onProgress?.onProgress(DumpProgress("Menulis dump.cs", 0.96f))
             val dumpCsFile = File(outputDir, "dump.cs")
-            val typeWritten = DumpCsWriter(settings).write(metadata, dumpCsFile, rvaResult)
+            val libBytes = libFile.readBytes()
+            val typeWritten = DumpCsWriter(settings).write(metadata, dumpCsFile, rvaResult, elfInfo, libBytes)
             outputFiles += dumpCsFile
             logLines += "dump.cs types written: $typeWritten"
             logLines += "wrote: ${dumpCsFile.absolutePath}"
