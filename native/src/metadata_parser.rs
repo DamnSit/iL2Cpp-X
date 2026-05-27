@@ -363,12 +363,23 @@ impl MetadataParser {
             detect_image_type_offsets(reader, &ranges, image_def_size, image_name_offset);
 
         // MethodDef field offsets
+        let method_range = ranges.iter().find(|r| r.name == "methods");
         let (method_return_type, method_parameter_start, method_token,
              method_param_count, method_flags, method_iflags) =
-            detect_method_offsets(method_def_size, version);
+            if let Some(mr) = method_range {
+                detect_method_offsets(reader, &ranges, mr, method_def_size, version)
+            } else {
+                (8, 12, 32, 24, 26, 28)
+            };
 
-        // ParameterDef type_index offset
-        let param_type_index = if param_def_size >= 12 { 12 } else { 4 };
+        // ParameterDef type_index offset:
+        // stride 8:  nameIndex(+0), typeIndex(+4)
+        // stride 12: nameIndex(+0), token(+4), typeIndex(+8)
+        // stride 16: nameIndex(+0), token(+4), typeIndex(+8), extra(+12)
+        let param_type_index = match param_def_size {
+            8 => 4,
+            _ => 8, // 12 and 16 both have typeIndex at +8
+        };
 
         let config = VersionConfig {
             type_def_size,
@@ -562,27 +573,72 @@ fn detect_image_type_offsets(
     best
 }
 
-/// Detect MethodDef field offsets based on stride and version.
-fn detect_method_offsets(stride: usize, _version: u32) -> (usize, usize, usize, usize, usize, usize) {
-    // Common MethodDef layouts:
-    // v16-v23 (stride=28): nameIndex(+0), declaringType(+4), returnType(+8), parameterStart(+12),
-    //   genericContainerIndex(+16), methodIndex(+20), invokerIndex(+24)...
-    //   parameterCount at +18, flags at +20, iflags at +22, token at +24
-    //
-    // v24-v30 (stride=32): nameIndex(+0), declaringType(+4), returnType(+8), parameterStart(+12),
-    //   genericContainerIndex(+16), parameterCount(+20), flags(+22), iflags(+24), slot(+26), token(+28)
-    //
-    // v31+ (stride=36): like v24 but genericContainerIndex is i64 (+16..+24)
-    //   parameterCount(+20), flags(+22), iflags(+24), slot(+26), token(+32)
-    //
-    // v33+ (stride=40): extra fields after token
+/// Detect MethodDef field offsets by testing candidate layouts.
+/// Returns (return_type, parameter_start, token, param_count, flags, iflags).
+fn detect_method_offsets(
+    reader: &BinaryReader,
+    ranges: &[MetadataRange],
+    method_range: &MetadataRange,
+    stride: usize,
+    _version: u32,
+) -> (usize, usize, usize, usize, usize, usize) {
+    let param_range = ranges.iter().find(|r| r.name == "parameters");
+    let param_size = param_range.map(|r| r.size).unwrap_or(0);
 
-    match stride {
-        24..=28 => (8, 12, 24, 18, 20, 22), // v16-v23
-        30..=32 => (8, 12, 28, 20, 22, 24), // v24-v30
-        34..=36 => (8, 12, 32, 20, 22, 24), // v31-v32
-        _       => (8, 12, 32, 20, 22, 24), // v33+
+    // Candidate layouts: (return_type, parameter_start, token, param_count, flags, iflags)
+    let candidates: Vec<(usize, usize, usize, usize, usize, usize)> = match stride {
+        24..=28 => vec![
+            (8, 12, 24, 18, 20, 22), // v16-v23 standard
+        ],
+        30..=32 => vec![
+            (8, 12, 28, 20, 22, 24), // v24-v30 standard (4-byte genericContainerIndex)
+        ],
+        34..=36 => vec![
+            // 64-bit genericContainerIndex at +16 (8 bytes)
+            (8, 12, 32, 24, 26, 28),
+            // 4-byte genericContainerIndex at +16 + extra field at end
+            (8, 12, 32, 20, 22, 24),
+        ],
+        _ => vec![
+            (8, 12, 32, 24, 26, 28), // 64-bit genericContainerIndex
+            (8, 12, 32, 20, 22, 24), // 4-byte genericContainerIndex
+        ],
+    };
+
+    let count = method_range.size / stride;
+    if count < 2 {
+        return candidates[0];
     }
+
+    let sample = std::cmp::min(count, 200);
+    let mut best = candidates[0];
+    let mut best_score = 0i32;
+
+    for &(rt, ps, _tk, pc, _fl, _ifl) in &candidates {
+        if ps + 4 > stride || pc + 2 > stride {
+            continue;
+        }
+        let mut score = 0i32;
+        for i in 0..sample {
+            let offset = method_range.offset + i * stride;
+            // Check parameterCount is reasonable
+            let param_count = reader.read_u16_le(offset + pc).unwrap_or(0xFFFF);
+            if param_count < 200 {
+                score += 2;
+            }
+            // Check parameterStart is within parameter table range
+            let param_start = reader.read_i32_le(offset + ps).unwrap_or(-1);
+            if param_start >= 0 && (param_start as usize) < param_size {
+                score += 2;
+            }
+        }
+        if score > best_score {
+            best_score = score;
+            best = (rt, ps, _tk, pc, _fl, _ifl);
+        }
+    }
+
+    best
 }
 
 fn read_header_ranges(reader: &BinaryReader, count: usize) -> std::io::Result<Vec<MetadataRange>> {
