@@ -163,19 +163,6 @@ fn detect_stride(
         if score > best_score {
             best_score = score;
             best_stride = stride;
-        } else if score == best_score && score > 0 && version >= 27 {
-            // Tiebreaker for v27+: prefer stride 12 over stride 8 for field/param tables.
-            // v27+ adds a token field, making the correct stride 12 (typeIndex at +8).
-            // When tokens are zero, stride 8 and 12 produce identical byte patterns,
-            // so we need this tiebreaker to pick the correct one.
-            let is_field_or_param = table_name == "fields" || table_name == "parameters";
-            if is_field_or_param {
-                if stride == 12 && best_stride == 8 {
-                    best_stride = stride;
-                } else if stride == 16 && (best_stride == 8 || best_stride == 12) {
-                    best_stride = stride;
-                }
-            }
         }
     }
 
