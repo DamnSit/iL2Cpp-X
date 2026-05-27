@@ -75,7 +75,7 @@ pub fn dump_native(
         include_rva_info,
         include_inheritance: true,
     };
-    let types_written = match writer.write_with_elf(&metadata, &dump_cs_path, &rva_result, Some(&elf_info), Some(&lib_bytes)) {
+    let types_written = match writer.write_with_elf(&metadata, &dump_cs_path, &rva_result, Some(&elf_info), Some(&lib_bytes), &mut log_lines) {
         Ok(n) => n,
         Err(e) => {
             log_lines.push(format!("dump.cs write error: {}", e));

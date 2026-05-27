@@ -211,7 +211,7 @@ pub fn dump(
         include_rva_info,
         include_inheritance,
     };
-    match writer.write_with_elf(&metadata, &dump_cs_path, &rva_result, Some(&elf_info), Some(&lib_bytes)) {
+    match writer.write_with_elf(&metadata, &dump_cs_path, &rva_result, Some(&elf_info), Some(&lib_bytes), &mut log) {
         Ok(count) => {
             log.push(format!("dump.cs types written: {}", count));
             log.push(format!("wrote: {}", dump_cs_path));
