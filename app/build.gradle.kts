@@ -160,15 +160,6 @@ val buildRust by tasks.registering(Exec::class) {
     doFirst {
         println("Building Rust native library for Android...")
     }
-    doLast {
-        if (execResult.exitValue == 0) {
-            println("Rust native library built successfully")
-        } else {
-            println("WARNING: Rust build skipped (exit code ${execResult.exitValue}).")
-            println("Install cargo-ndk: cargo install cargo-ndk")
-            println("Add targets: rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android")
-        }
-    }
 }
 
 // Wire Rust build as preBuild dependency
