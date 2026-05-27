@@ -76,12 +76,15 @@ struct VersionConfig {
 
 /// Detect the stride for a metadata table by testing candidate strides.
 /// Returns the stride that produces the best combined score of valid strings + unique names + reasonable count.
+/// When version >= 27, prefers stride 12 over stride 8 for fields/parameters as a tiebreaker
+/// (v27+ adds a token field, making the correct stride 12).
 fn detect_stride(
     reader: &BinaryReader,
     ranges: &[MetadataRange],
     table_name: &str,
     candidates: &[usize],
     use_varint: bool,
+    version: u32,
 ) -> usize {
     let table_range = match ranges.iter().find(|r| r.name == table_name) {
         Some(r) => r,
@@ -95,6 +98,9 @@ fn detect_stride(
         Some(r) => r,
         None => return candidates[0],
     };
+
+    // For fields/parameters tables, also check type_index validity to disambiguate stride 8 vs 12
+    let type_range = ranges.iter().find(|r| r.name == "typeDefinitions");
 
     let mut best_stride = candidates[0];
     let mut best_score = 0i32;
@@ -123,10 +129,53 @@ fn detect_stride(
         }
         // Score combines: valid string ratio + uniqueness ratio
         // Unique names are important — with wrong stride, consecutive entries share nameIndex
-        let score = valid * 2 + unique_names.len() as i32;
+        let mut score = valid * 2 + unique_names.len() as i32;
+
+        // For field/parameter tables: validate type_index at the correct offset.
+        // stride 8:  typeIndex at +4
+        // stride 12+: typeIndex at +8 (token field at +4)
+        // If the typeIndex offset produces valid-looking type indices, boost the score.
+        if let Some(tr) = type_range {
+            if tr.size > 0 {
+                // type_index is a sequential index into the types array.
+                // Use a generous upper bound based on the type table size.
+                // The actual type count = tr.size / type_def_size, but we don't know
+                // type_def_size here. Use tr.size / 64 (min stride) as upper bound.
+                let max_type_idx = tr.size / 64;
+                let ti_offset = if stride >= 12 { 8 } else { 4 };
+                if ti_offset + 4 <= stride {
+                    let mut ti_valid = 0i32;
+                    for i in 0..sample {
+                        let offset = table_range.offset + i * stride;
+                        if offset + ti_offset + 4 > reader.size() {
+                            break;
+                        }
+                        let ti = reader.read_i32_le(offset + ti_offset).unwrap_or(-1);
+                        if ti >= 0 && (ti as usize) < max_type_idx {
+                            ti_valid += 1;
+                        }
+                    }
+                    score += ti_valid;
+                }
+            }
+        }
+
         if score > best_score {
             best_score = score;
             best_stride = stride;
+        } else if score == best_score && score > 0 && version >= 27 {
+            // Tiebreaker for v27+: prefer stride 12 over stride 8 for field/param tables.
+            // v27+ adds a token field, making the correct stride 12 (typeIndex at +8).
+            // When tokens are zero, stride 8 and 12 produce identical byte patterns,
+            // so we need this tiebreaker to pick the correct one.
+            let is_field_or_param = table_name == "fields" || table_name == "parameters";
+            if is_field_or_param {
+                if stride == 12 && best_stride == 8 {
+                    best_stride = stride;
+                } else if stride == 16 && (best_stride == 8 || best_stride == 12) {
+                    best_stride = stride;
+                }
+            }
         }
     }
 
@@ -324,27 +373,27 @@ impl MetadataParser {
         let type_def_size = detect_stride(
             reader, &ranges, "typeDefinitions",
             &[64, 72, 80, 88, 96, 104, 112, 120, 128, 136],
-            use_varint,
+            use_varint, version,
         );
         let method_def_size = detect_stride(
             reader, &ranges, "methods",
             &[24, 28, 32, 36, 40, 44],
-            use_varint,
+            use_varint, version,
         );
         let field_def_size = detect_stride(
             reader, &ranges, "fields",
             &[8, 12, 16],
-            use_varint,
+            use_varint, version,
         );
         let param_def_size = detect_stride(
             reader, &ranges, "parameters",
             &[8, 12, 16],
-            use_varint,
+            use_varint, version,
         );
         let image_def_size = detect_stride(
             reader, &ranges, "images",
             &[24, 32, 40, 48, 56, 64],
-            use_varint,
+            use_varint, version,
         );
 
         // Detect TypeDef field offsets
@@ -808,6 +857,11 @@ fn read_fields(reader: &BinaryReader, ranges: &[MetadataRange], config: &Version
         Some(r) => r,
         None => return Vec::new(),
     };
+    // typeIndex offset depends on stride:
+    // stride 8:  nameIndex(+0), typeIndex(+4)
+    // stride 12: nameIndex(+0), token(+4), typeIndex(+8)
+    // stride 16: nameIndex(+0), token(+4), typeIndex(+8), extra(+12)
+    let type_index_offset = if config.field_def_size >= 12 { 8 } else { 4 };
     let count = field_range.size / config.field_def_size;
     let mut fields = Vec::with_capacity(count);
     for index in 0..count {
@@ -817,7 +871,7 @@ fn read_fields(reader: &BinaryReader, ranges: &[MetadataRange], config: &Version
         fields.push(MetadataFieldDefinition {
             index,
             name: read_metadata_string(reader, ranges, name_idx, config.use_varint_strings),
-            type_index: reader.read_i32_le(offset + 4).unwrap_or(0) as usize,
+            type_index: reader.read_i32_le(offset + type_index_offset).unwrap_or(0) as usize,
         });
     }
     fields
