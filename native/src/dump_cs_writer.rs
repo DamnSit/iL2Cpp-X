@@ -133,8 +133,37 @@ impl DumpCsWriter {
         // types_array_va points to array of Il2CppType* pointers
         let types_ptr_array_foff = elf_info.vaddr_to_file_offset(types_array_va)? as usize;
         debug_log.push(format!("types_array_va=0x{:x} foff=0x{:x} count={}", types_array_va, types_ptr_array_foff, types_count));
+
+        // Determine actual array size by scanning for the highest valid pointer.
+        // typesCount from the struct might be wrong — scan up to a reasonable limit.
+        let max_scan = std::cmp::min(types_count * 3, 200000);
+        let mut actual_count = 0usize;
+        let mut max_valid_index = 0usize;
+        let mut consecutive_nulls = 0usize;
+        for i in 0..max_scan {
+            let off = types_ptr_array_foff + i * ptr_size;
+            if off + ptr_size > bytes.len() { break; }
+            let ptr = if is_64 {
+                crate::rva_resolver::read_u64(bytes, off, is_le)
+            } else {
+                crate::rva_resolver::read_u32(bytes, off, is_le) as u64
+            };
+            if ptr == 0 {
+                consecutive_nulls += 1;
+                if consecutive_nulls > 100 { break; }
+                continue;
+            }
+            consecutive_nulls = 0;
+            if elf_info.vaddr_to_file_offset(ptr).is_some() {
+                actual_count = i + 1;
+                max_valid_index = i;
+            }
+        }
+        let effective_count = actual_count;
+        debug_log.push(format!("types array scan: effective_count={} max_valid_index={}", effective_count, max_valid_index));
+
         // Log first few pointers from the array
-        for dbg_i in 0..std::cmp::min(types_count, 3) {
+        for dbg_i in 0..std::cmp::min(effective_count, 3) {
             let dbg_off = types_ptr_array_foff + dbg_i * ptr_size;
             if dbg_off + ptr_size <= bytes.len() {
                 let dbg_ptr = if is_64 {
@@ -171,7 +200,7 @@ impl DumpCsWriter {
             (24, "IntPtr"), (25, "UIntPtr"),
         ];
 
-        for i in 0..types_count {
+        for i in 0..effective_count {
             // Read the pointer from the array
             let ptr_entry_off = types_ptr_array_foff + i * ptr_size;
             if ptr_entry_off + ptr_size > bytes.len() {
@@ -245,7 +274,7 @@ impl DumpCsWriter {
             }
         }
 
-        debug_log.push(format!("Il2CppType resolved: {} types (of {} in array)", map.len(), types_count));
+        debug_log.push(format!("Il2CppType resolved: {} types (of {} in array, effective={})", map.len(), types_count, effective_count));
         // Log some sample resolved entries
         let mut sample_keys: Vec<usize> = map.keys().copied().collect();
         sample_keys.sort();
