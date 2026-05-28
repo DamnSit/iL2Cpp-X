@@ -964,7 +964,7 @@ impl DumpCsWriter {
 
                 // Found a candidate MR struct at `pos`.
                 // MetadataRegistration layout (64-bit): 8 (count, pointer) pairs.
-                // types_count at offset 48 = pair[6].count, types ptr at offset 56 = pair[6].ptr
+                // types_count at offset 48 = pair[3].count, types ptr at offset 56 = pair[3].ptr
                 let types_count_off = pos + 6 * ptr_size;
                 let types_ptr_off = types_count_off + ptr_size;
                 if types_ptr_off + ptr_size > lib_bytes.len() { continue; }
@@ -989,14 +989,12 @@ impl DumpCsWriter {
 
                 // Validate: sample entries from the types array should be
                 // valid Il2CppType structs. Check for kind diversity (multiple
-                // different kind values) and consistent stride.
+                // different kind values) and valid pointer targets.
                 if types_foff + 5 * ptr_size > lib_bytes.len() { continue; }
 
                 let mut valid = 0usize;
                 let mut checked = 0usize;
                 let mut kind_set = std::collections::HashSet::new();
-                let mut prev_ptr = 0u64;
-                let mut strides = Vec::new();
                 let step = if types_count > 100 { types_count / 20 } else { 1 };
 
                 for i in (0..types_count).step_by(step).take(20) {
@@ -1018,28 +1016,16 @@ impl DumpCsWriter {
                         valid += 1;
                         kind_set.insert(kind);
                     }
-                    if prev_ptr > 0 && type_ptr > prev_ptr {
-                        strides.push(type_ptr - prev_ptr);
-                    }
-                    prev_ptr = type_ptr;
                     checked += 1;
                 }
 
-                // Require: most entries valid, 3+ distinct kind values, consistent stride
-                let stride_ok = if strides.len() >= 2 {
-                    strides[0] >= 8 && strides[0] <= 64 && strides.iter().all(|&s| s == strides[0])
-                } else if strides.len() == 1 {
-                    strides[0] >= 8 && strides[0] <= 64
-                } else {
-                    false
-                };
-
-                if checked >= 15 && valid * 100 >= checked * 80 && kind_set.len() >= 3 && stride_ok {
+                // Require: most entries valid, 3+ distinct kind values
+                if checked >= 15 && valid * 100 >= checked * 80 && kind_set.len() >= 3 {
                     let mr_va = seg_va + (pos - seg_start) as u64;
                     let types_va = elf_info.file_offset_to_vaddr(types_foff as u64)
                         .unwrap_or(seg_va + (types_foff as u64 - seg.offset));
-                    debug_log.push(format!("  scan: MR at va=0x{:x} pairs={} types_count={} types_ptr=0x{:x} stride={} kinds={} valid={}/{}",
-                        mr_va, pairs_ok, types_count, types_ptr, strides[0], kind_set.len(), valid, checked));
+                    debug_log.push(format!("  scan: MR at va=0x{:x} pairs={} types_count={} types_ptr=0x{:x} kinds={} valid={}/{}",
+                        mr_va, pairs_ok, types_count, types_ptr, kind_set.len(), valid, checked));
                     return Some((types_va, types_count));
                 }
             }
