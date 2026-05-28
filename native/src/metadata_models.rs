@@ -24,12 +24,16 @@ pub struct MetadataTypeDefinition {
     pub index: usize,
     pub name: String,
     pub namespace_name: String,
+    pub byval_type_index: i32,
     pub field_start: usize,
     pub method_start: usize,
     pub property_start: usize,
     pub field_count: usize,
     pub method_count: usize,
     pub property_count: usize,
+    pub parent_index: i32,
+    pub flags: u32,
+    pub bitfield: u32,
 }
 
 #[derive(Clone, Debug)]

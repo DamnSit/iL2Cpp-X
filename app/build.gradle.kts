@@ -169,6 +169,9 @@ val buildRust by tasks.registering {
         println("Building Rust native library for Android...")
         exec {
             workingDir = file("../native")
+            // Use rustup-managed rustc (has Android targets)
+            val rustupBin = System.getProperty("user.home") + "/.cargo/bin"
+            environment("RUSTC", "$rustupBin/rustc")
             commandLine("cargo", "ndk",
                 "-t", "arm64-v8a",
                 "-t", "armeabi-v7a",

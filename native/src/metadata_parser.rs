@@ -63,6 +63,9 @@ struct VersionConfig {
     type_method_count: usize,
     type_property_count: usize,
     type_field_count: usize,
+    type_parent_index: usize,
+    type_flags_offset: usize,
+    type_bitfield: usize,
 
     method_def_size: usize,
     method_return_type: usize,
@@ -224,6 +227,25 @@ fn is_valid_string_index(
             Some(b) if b != 0 => true,
             _ => false,
         }
+    }
+}
+
+/// Returns (parent_index_offset, flags_offset, bitfield_offset) for the given stride.
+/// These are constant for a given stride (not validated heuristically).
+fn type_extra_offsets(stride: usize) -> (usize, usize, usize) {
+    match stride {
+        // (parent_index, flags, bitfield)
+        64  => (8,  20, 56),
+        72  => (8,  20, 64),
+        80  => (12, 24, 72),
+        88  => (16, 28, 80),  // v31 confirmed
+        96  => (16, 28, 88),
+        104 => (16, 36, 96),
+        112 => (16, 36, 104),
+        120 => (16, 36, 112),
+        128 => (16, 36, 120),
+        136 => (16, 36, 128),
+        _   => (16, 28, stride - 8),
     }
 }
 
@@ -406,6 +428,7 @@ impl MetadataParser {
             } else {
                 (52, 56, 64, 72, 74, 76)
             };
+        let (type_parent_index, type_flags_offset, type_bitfield) = type_extra_offsets(type_def_size);
 
         // ImageDef name offset detection: find which i32 offset has valid string indices
         let image_name_offset = detect_image_name_offset(reader, &ranges, image_def_size);
@@ -436,6 +459,9 @@ impl MetadataParser {
             type_method_count,
             type_property_count,
             type_field_count,
+            type_parent_index,
+            type_flags_offset,
+            type_bitfield,
             method_def_size,
             method_return_type,
             method_parameter_start,
@@ -839,12 +865,16 @@ fn read_types(reader: &BinaryReader, ranges: &[MetadataRange], config: &VersionC
             index,
             name: read_metadata_string(reader, ranges, name_idx, config.use_varint_strings),
             namespace_name: read_metadata_string(reader, ranges, ns_idx, config.use_varint_strings),
+            byval_type_index: reader.read_i32_le(offset + 8).unwrap_or(-1),
             field_start: reader.read_i32_le(offset + config.type_field_start).unwrap_or(0) as usize,
             method_start: reader.read_i32_le(offset + config.type_method_start).unwrap_or(0) as usize,
             property_start: reader.read_i32_le(offset + config.type_property_start).unwrap_or(0) as usize,
             method_count: reader.read_u16_le(offset + config.type_method_count).unwrap_or(0) as usize,
             property_count: reader.read_u16_le(offset + config.type_property_count).unwrap_or(0) as usize,
             field_count: reader.read_u16_le(offset + config.type_field_count).unwrap_or(0) as usize,
+            parent_index: reader.read_i32_le(offset + config.type_parent_index).unwrap_or(-1),
+            flags: reader.read_u32_le(offset + config.type_flags_offset).unwrap_or(0),
+            bitfield: reader.read_u32_le(offset + config.type_bitfield).unwrap_or(0),
         });
     }
     types
