@@ -403,16 +403,25 @@ impl MetadataParser {
             &[24, 28, 32, 36, 40, 44],
             use_varint, version,
         );
-        let field_def_size = detect_stride(
-            reader, &ranges, "fields",
-            &[8, 12, 16],
-            use_varint, version,
-        );
-        let param_def_size = detect_stride(
-            reader, &ranges, "parameters",
-            &[8, 12, 16],
-            use_varint, version,
-        );
+        // v29+ removed the token field from FieldDef and ParameterDef, so stride is 8.
+        // For older versions, stride is 12 (nameIndex + typeIndex + token).
+        let field_def_size = if version >= 29 {
+            8
+        } else {
+            detect_stride(reader, &ranges, "fields", &[8, 12, 16], use_varint, version)
+        };
+        let param_def_size = if version >= 29 {
+            8
+        } else {
+            detect_stride(reader, &ranges, "parameters", &[8, 12, 16], use_varint, version)
+        };
+
+        STRIDE_LOGS.with(|logs| {
+            logs.borrow_mut().push(format!(
+                "[stride-final] version={} typeDef={} method={} field={} param={}",
+                version, type_def_size, method_def_size, field_def_size, param_def_size
+            ));
+        });
         let image_def_size = detect_stride(
             reader, &ranges, "images",
             &[24, 32, 40, 48, 56, 64],

@@ -219,7 +219,7 @@ impl DumpCsWriter {
                 }
             }
             if image_base == 0 {
-                debug_log.push("  WARNING: could not compute image_base/td_size — CLASS/VALUETYPE types will show as T-indexes".to_string());
+                debug_log.push("  image_base=0 (all CLASS/VALUETYPE data < 0x10000, using direct TypeDef index lookup)".to_string());
             }
         }
 
