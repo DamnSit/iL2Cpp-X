@@ -887,10 +887,10 @@ impl DumpCsWriter {
         None
     }
 
-    /// Scan data segments for the MetadataRegistration types array.
-    /// Uses the count-pattern strategy: search for the known types_count
-    /// (= metadata.types.len()) as u32 LE in non-executable data segments,
-    /// then read the pointer that follows and validate the types array entries.
+    /// Scan data segments for the MetadataRegistration struct by looking for
+    /// consecutive (count, pointer) pairs. The struct has 8 such pairs.
+    /// Counts are int32_t (survive relocations), pointers are relocated.
+    /// We find the struct, then read types_count at +48 and types ptr at +56.
     fn find_types_by_scan(
         lib_bytes: &[u8],
         elf_info: &ElfInfo,
@@ -899,119 +899,125 @@ impl DumpCsWriter {
         ptr_size: usize,
         debug_log: &mut Vec<String>,
     ) -> Option<(u64, usize)> {
+        let is_64 = elf_info.is_64bit;
         let type_kind_offset = if is_le { ptr_size + 2 } else { ptr_size + 1 };
-        let types_count = metadata.types.len();
 
-        if types_count == 0 {
-            debug_log.push("  scan: no types in metadata".to_string());
-            return None;
-        }
-
-        // Serialize types_count as u32 LE bytes to search for
-        let count_bytes = (types_count as u32).to_le_bytes();
-
-        let data_segments: Vec<_> = elf_info
-            .load_segments()
-            .into_iter()
+        // Get data segment VA range for pointer validation
+        let data_segs: Vec<_> = elf_info.load_segments().into_iter()
             .filter(|s| (s.flags & 0x1) == 0 && s.filesz > 0)
             .collect();
+        let all_segs = elf_info.load_segments();
 
-        debug_log.push(format!("  scan: searching for types_count={} in {} data segments", types_count, data_segments.len()));
+        let td_count = metadata.types.len(); // type_definitions_count
+        debug_log.push(format!("  scan: td_count={}, searching for MR struct pattern", td_count));
 
-        for seg in &data_segments {
+        // Scan each data segment for the MetadataRegistration struct pattern.
+        // The struct starts with 8 consecutive (count, pointer) pairs.
+        // On 64-bit: each pair = int32_t count + 4 pad + 8 ptr = 16 bytes.
+        // We scan for positions where multiple consecutive pairs match.
+        for seg in &data_segs {
             let seg_start = seg.offset as usize;
             let seg_end = (seg_start + seg.filesz as usize).min(lib_bytes.len());
             let seg_va = seg.vaddr;
 
-            // Search for occurrences of types_count as u32 LE at pointer-aligned positions
-            for pos in (seg_start..seg_end.saturating_sub(8)).step_by(ptr_size) {
-                if pos + 4 > lib_bytes.len() { break; }
+            let pair_size = ptr_size * 2; // 16 bytes on 64-bit
+            let min_struct = pair_size * 4; // need at least 4 pairs
 
-                // Check if types_count bytes match at this position
-                if lib_bytes[pos] != count_bytes[0]
-                    || lib_bytes[pos + 1] != count_bytes[1]
-                    || lib_bytes[pos + 2] != count_bytes[2]
-                    || lib_bytes[pos + 3] != count_bytes[3]
-                {
-                    continue;
+            for pos in (seg_start..seg_end.saturating_sub(min_struct)).step_by(ptr_size) {
+                // Check up to 8 consecutive (count, pointer) pairs
+                let mut pairs_ok = 0usize;
+                for pi in 0..8usize {
+                    let count_off = pos + pi * pair_size;
+                    let ptr_off = count_off + ptr_size;
+                    if ptr_off + ptr_size > lib_bytes.len() { break; }
+
+                    // Read count (u32, survives relocations)
+                    let count = crate::rva_resolver::read_u32(lib_bytes, count_off, is_le) as u64;
+                    // Count should be reasonable: non-zero, < 10M
+                    if count == 0 || count > 10_000_000 { break; }
+
+                    // Read pointer (relocated, should be a data VA)
+                    let ptr = if is_64 {
+                        crate::rva_resolver::read_u64(lib_bytes, ptr_off, is_le)
+                    } else {
+                        crate::rva_resolver::read_u32(lib_bytes, ptr_off, is_le) as u64
+                    };
+                    // Pointer should be in a load segment
+                    if ptr < 0x10000 { break; }
+                    let mut in_segment = false;
+                    for s in &all_segs {
+                        if ptr >= s.vaddr && ptr < s.vaddr + s.memsz {
+                            in_segment = true; break;
+                        }
+                    }
+                    if !in_segment { break; }
+
+                    pairs_ok += 1;
                 }
 
-                // Found types_count. Read the pointer at +ptr_size (the field after the count).
-                // In MetadataRegistration, types_count is at offset 48 and types ptr is at offset 56.
-                // The count field is int32_t (4 bytes) + 4 bytes padding, then the pointer (8 bytes).
-                let ptr_pos = pos + ptr_size;
-                if ptr_pos + ptr_size > lib_bytes.len() { continue; }
+                // Need at least 6 matching pairs to be confident
+                if pairs_ok < 6 { continue; }
 
-                let types_ptr = if ptr_size == 8 {
-                    crate::rva_resolver::read_u64(lib_bytes, ptr_pos, is_le)
+                // Found a candidate MR struct at `pos`.
+                // MetadataRegistration layout (64-bit): 8 (count, pointer) pairs.
+                // types_count at offset 48 = pair[6].count, types ptr at offset 56 = pair[6].ptr
+                let types_count_off = pos + 6 * ptr_size;
+                let types_ptr_off = types_count_off + ptr_size;
+                if types_ptr_off + ptr_size > lib_bytes.len() { continue; }
+
+                let types_count = crate::rva_resolver::read_u32(lib_bytes, types_count_off, is_le) as usize;
+                let types_ptr = if is_64 {
+                    crate::rva_resolver::read_u64(lib_bytes, types_ptr_off, is_le)
                 } else {
-                    crate::rva_resolver::read_u32(lib_bytes, ptr_pos, is_le) as u64
+                    crate::rva_resolver::read_u32(lib_bytes, types_ptr_off, is_le) as u64
                 };
 
+                if types_count == 0 || types_count > 500_000 { continue; }
                 if types_ptr < 0x10000 { continue; }
 
-                // Validate: types_ptr must map to a file offset in a data segment
                 let types_foff = match elf_info.vaddr_to_file_offset(types_ptr) {
                     Some(o) => o as usize,
                     None => continue,
                 };
-
-                // Check that the array fits in the file
                 if types_foff + types_count * ptr_size > lib_bytes.len() { continue; }
 
-                // Validate: sample 10 entries from the types array.
-                // Each entry should be a pointer to a valid Il2CppType struct
-                // with a reasonable type kind byte (1-0x1E).
+                // Validate: sample entries from the types array.
+                // Each entry should be a pointer to a valid Il2CppType struct.
                 let mut valid = 0usize;
                 let mut checked = 0usize;
-                let step_size = if types_count > 20 { types_count / 10 } else { 1 };
+                let step = if types_count > 20 { types_count / 10 } else { 1 };
 
-                for i in (0..types_count).step_by(step_size).take(10) {
+                for i in (0..types_count).step_by(step).take(10) {
                     let entry_off = types_foff + i * ptr_size;
                     if entry_off + ptr_size > lib_bytes.len() { break; }
-
-                    let type_struct_va = if ptr_size == 8 {
+                    let type_ptr = if is_64 {
                         crate::rva_resolver::read_u64(lib_bytes, entry_off, is_le)
                     } else {
                         crate::rva_resolver::read_u32(lib_bytes, entry_off, is_le) as u64
                     };
-                    if type_struct_va == 0 || type_struct_va < 0x10000 { checked += 1; continue; }
-
-                    let type_foff = match elf_info.vaddr_to_file_offset(type_struct_va) {
+                    if type_ptr == 0 || type_ptr < 0x10000 { checked += 1; continue; }
+                    let type_foff = match elf_info.vaddr_to_file_offset(type_ptr) {
                         Some(o) => o as usize,
                         None => { checked += 1; continue; },
                     };
                     if type_foff + type_kind_offset + 1 > lib_bytes.len() { checked += 1; continue; }
-
                     let kind = lib_bytes[type_foff + type_kind_offset];
-                    if kind >= 1 && kind <= 0x1E {
-                        // For primitives (kind 1-14), data union should be 0
-                        if kind <= 0x0E {
-                            let data = if ptr_size == 8 {
-                                crate::rva_resolver::read_u64(lib_bytes, type_foff, is_le)
-                            } else {
-                                crate::rva_resolver::read_u32(lib_bytes, type_foff, is_le) as u64
-                            };
-                            if data == 0 { valid += 1; }
-                        } else {
-                            valid += 1;
-                        }
-                    }
+                    if kind >= 1 && kind <= 0x1E { valid += 1; }
                     checked += 1;
                 }
 
-                // Require 8/10 valid entries
-                if checked >= 8 && valid >= 8 {
-                    let array_va = elf_info.file_offset_to_vaddr(types_foff as u64)
+                if checked >= 8 && valid * 100 >= checked * 80 {
+                    let mr_va = seg_va + (pos - seg_start) as u64;
+                    let types_va = elf_info.file_offset_to_vaddr(types_foff as u64)
                         .unwrap_or(seg_va + (types_foff as u64 - seg.offset));
-                    debug_log.push(format!("  count-scan: types_count={} at foff=0x{:x}, types_ptr=0x{:x} (foff=0x{:x}), valid={}/{}",
-                        types_count, pos, types_ptr, types_foff, valid, checked));
-                    return Some((array_va, types_count));
+                    debug_log.push(format!("  scan: MR at va=0x{:x} pairs={} types_count={} types_ptr=0x{:x} valid={}/{}",
+                        mr_va, pairs_ok, types_count, types_ptr, valid, checked));
+                    return Some((types_va, types_count));
                 }
             }
         }
 
-        debug_log.push("  count-scan: no valid candidate found".to_string());
+        debug_log.push("  scan: no valid MetadataRegistration found".to_string());
         None
     }
 
