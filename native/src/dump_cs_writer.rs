@@ -153,12 +153,16 @@ impl DumpCsWriter {
                 td_names.insert(td.index, name);
             }
         }
-        let primitive_names: [(u8, &str); 18] = [
-            (1, "void"), (2, "bool"), (3, "char"), (4, "sbyte"), (5, "byte"),
-            (6, "short"), (7, "ushort"), (8, "int"), (9, "uint"),
-            (10, "long"), (11, "ulong"), (12, "float"), (13, "double"),
-            (14, "string"), (15, "object"), (22, "TypedReference"),
-            (24, "IntPtr"), (25, "UIntPtr"),
+        let primitive_names: [(u8, &str); 30] = [
+            (0x01, "void"), (0x02, "bool"), (0x03, "char"), (0x04, "sbyte"), (0x05, "byte"),
+            (0x06, "short"), (0x07, "ushort"), (0x08, "int"), (0x09, "uint"),
+            (0x0A, "long"), (0x0B, "ulong"), (0x0C, "float"), (0x0D, "double"),
+            (0x0E, "string"), (0x0F, "void*"), (0x10, "ref"),
+            (0x11, "ValueType"), (0x12, "class"), (0x13, "var"),
+            (0x14, "array"), (0x15, "GenericInst"), (0x16, "TypedReference"),
+            (0x18, "IntPtr"), (0x19, "UIntPtr"),
+            (0x1B, "FnPtr"), (0x1C, "object"), (0x1D, "SZArray"),
+            (0x1E, "MVar"), (0x1F, "CModReqd"), (0x20, "CModOpt"),
         ];
 
         // Compute image_base and td_size for CLASS/VALUETYPE v27+ type handle resolution.
@@ -972,7 +976,9 @@ impl DumpCsWriter {
                     crate::rva_resolver::read_u32(lib_bytes, types_ptr_off, is_le) as u64
                 };
 
+                // types_count must be plausible: at least td_count/4 and no more than 500K
                 if types_count == 0 || types_count > 500_000 { continue; }
+                if td_count > 0 && types_count < td_count / 4 { continue; }
                 if types_ptr < 0x10000 { continue; }
 
                 let types_foff = match elf_info.vaddr_to_file_offset(types_ptr) {
@@ -981,13 +987,19 @@ impl DumpCsWriter {
                 };
                 if types_foff + types_count * ptr_size > lib_bytes.len() { continue; }
 
-                // Validate: sample entries from the types array.
-                // Each entry should be a pointer to a valid Il2CppType struct.
+                // Validate: sample entries from the types array should be
+                // valid Il2CppType structs. Check for kind diversity (multiple
+                // different kind values) and consistent stride.
+                if types_foff + 5 * ptr_size > lib_bytes.len() { continue; }
+
                 let mut valid = 0usize;
                 let mut checked = 0usize;
-                let step = if types_count > 20 { types_count / 10 } else { 1 };
+                let mut kind_set = std::collections::HashSet::new();
+                let mut prev_ptr = 0u64;
+                let mut strides = Vec::new();
+                let step = if types_count > 100 { types_count / 20 } else { 1 };
 
-                for i in (0..types_count).step_by(step).take(10) {
+                for i in (0..types_count).step_by(step).take(20) {
                     let entry_off = types_foff + i * ptr_size;
                     if entry_off + ptr_size > lib_bytes.len() { break; }
                     let type_ptr = if is_64 {
@@ -1002,16 +1014,32 @@ impl DumpCsWriter {
                     };
                     if type_foff + type_kind_offset + 1 > lib_bytes.len() { checked += 1; continue; }
                     let kind = lib_bytes[type_foff + type_kind_offset];
-                    if kind >= 1 && kind <= 0x1E { valid += 1; }
+                    if kind >= 1 && kind <= 0x1E {
+                        valid += 1;
+                        kind_set.insert(kind);
+                    }
+                    if prev_ptr > 0 && type_ptr > prev_ptr {
+                        strides.push(type_ptr - prev_ptr);
+                    }
+                    prev_ptr = type_ptr;
                     checked += 1;
                 }
 
-                if checked >= 8 && valid * 100 >= checked * 80 {
+                // Require: most entries valid, 3+ distinct kind values, consistent stride
+                let stride_ok = if strides.len() >= 2 {
+                    strides[0] >= 8 && strides[0] <= 64 && strides.iter().all(|&s| s == strides[0])
+                } else if strides.len() == 1 {
+                    strides[0] >= 8 && strides[0] <= 64
+                } else {
+                    false
+                };
+
+                if checked >= 15 && valid * 100 >= checked * 80 && kind_set.len() >= 3 && stride_ok {
                     let mr_va = seg_va + (pos - seg_start) as u64;
                     let types_va = elf_info.file_offset_to_vaddr(types_foff as u64)
                         .unwrap_or(seg_va + (types_foff as u64 - seg.offset));
-                    debug_log.push(format!("  scan: MR at va=0x{:x} pairs={} types_count={} types_ptr=0x{:x} valid={}/{}",
-                        mr_va, pairs_ok, types_count, types_ptr, valid, checked));
+                    debug_log.push(format!("  scan: MR at va=0x{:x} pairs={} types_count={} types_ptr=0x{:x} stride={} kinds={} valid={}/{}",
+                        mr_va, pairs_ok, types_count, types_ptr, strides[0], kind_set.len(), valid, checked));
                     return Some((types_va, types_count));
                 }
             }
