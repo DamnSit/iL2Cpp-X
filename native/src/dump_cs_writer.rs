@@ -887,11 +887,10 @@ impl DumpCsWriter {
         None
     }
 
-    /// Scan all non-executable data segments for the Il2CppType** array.
-    /// Uses evenly-spaced probe indices across the full expected array range
-    /// to validate candidates. For the correct array, ALL probe entries should
-    /// be valid Il2CppType pointers. For wrong positions, entries at high
-    /// indices will be random data.
+    /// Scan data segments for the MetadataRegistration types array.
+    /// Uses the count-pattern strategy: search for the known types_count
+    /// (= metadata.types.len()) as u32 LE in non-executable data segments,
+    /// then read the pointer that follows and validate the types array entries.
     fn find_types_by_scan(
         lib_bytes: &[u8],
         elf_info: &ElfInfo,
@@ -901,49 +900,15 @@ impl DumpCsWriter {
         debug_log: &mut Vec<String>,
     ) -> Option<(u64, usize)> {
         let type_kind_offset = if is_le { ptr_size + 2 } else { ptr_size + 1 };
-        let td_count = metadata.types.len();
+        let types_count = metadata.types.len();
 
-        // Find the maximum type_index referenced in metadata
-        let mut max_meta_index: usize = 0;
-        for f in &metadata.fields {
-            if f.type_index > max_meta_index && f.type_index < 200000 {
-                max_meta_index = f.type_index;
-            }
-        }
-        for m in &metadata.methods {
-            if m.return_type > max_meta_index && m.return_type < 200000 {
-                max_meta_index = m.return_type;
-            }
-        }
-        for p in &metadata.parameters {
-            if p.type_index > max_meta_index && p.type_index < 200000 {
-                max_meta_index = p.type_index;
-            }
-        }
-
-        debug_log.push(format!("  scan: max metadata type_index={}", max_meta_index));
-
-        if max_meta_index == 0 {
-            debug_log.push("  scan: no metadata type indices found".to_string());
+        if types_count == 0 {
+            debug_log.push("  scan: no types in metadata".to_string());
             return None;
         }
 
-        // The types array must have at least (max_meta_index + 1) entries.
-        let min_array_entries = max_meta_index + 1;
-
-        // Build probe indices: evenly spaced across the full range, including
-        // the first few entries and the last few. These are the indices we check
-        // to validate whether a candidate position is the real types array.
-        let num_probes = 20usize;
-        let mut probe_indices: Vec<usize> = Vec::with_capacity(num_probes);
-        for i in 0..num_probes {
-            let idx = (i * (min_array_entries - 1)) / (num_probes - 1);
-            probe_indices.push(idx);
-        }
-        probe_indices.sort_unstable();
-        probe_indices.dedup();
-
-        debug_log.push(format!("  scan: probe_indices: {:?}", probe_indices));
+        // Serialize types_count as u32 LE bytes to search for
+        let count_bytes = (types_count as u32).to_le_bytes();
 
         let data_segments: Vec<_> = elf_info
             .load_segments()
@@ -951,139 +916,103 @@ impl DumpCsWriter {
             .filter(|s| (s.flags & 0x1) == 0 && s.filesz > 0)
             .collect();
 
-        let step = ptr_size;
-        let mut best: Option<(u64, usize, usize)> = None; // (array_va, count_hint, score)
+        debug_log.push(format!("  scan: searching for types_count={} in {} data segments", types_count, data_segments.len()));
 
         for seg in &data_segments {
             let seg_start = seg.offset as usize;
             let seg_end = (seg_start + seg.filesz as usize).min(lib_bytes.len());
             let seg_va = seg.vaddr;
-            // Segment must be large enough to hold the full array
-            if seg_end < seg_start + min_array_entries * ptr_size { continue; }
 
-            let mut pos = seg_start;
-            while pos + min_array_entries * ptr_size <= seg_end {
-                // Quick filter: first 3 entries must be valid Il2CppType pointers
-                // with valid kind bytes. For CLASS/VALUETYPE, data must be < td_count.
-                // Validate first 15 entries must be primitives (void, bool, char, ..., object)
-                // The IL2CPP types array always starts with primitive types at indices 0-14.
-                let mut early_ok = true;
-                let primitive_kinds: [u8; 15] = [0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x1C];
-                for check_idx in 0..15usize {
-                    let eoff = pos + check_idx * ptr_size;
-                    if eoff + ptr_size > lib_bytes.len() { early_ok = false; break; }
-                    let ptr = crate::rva_resolver::read_pointer(lib_bytes, eoff, ptr_size, is_le);
-                    if ptr < 0x10000 { early_ok = false; break; }
-                    let foff = match elf_info.vaddr_to_file_offset(ptr) {
-                        Some(o) => o as usize,
-                        None => { early_ok = false; break; }
-                    };
-                    if foff + type_kind_offset + 1 > lib_bytes.len() { early_ok = false; break; }
-                    let kind = lib_bytes[foff + type_kind_offset];
-                    if kind != primitive_kinds[check_idx] { early_ok = false; break; }
-                    // For primitives (0x01-0x0E), data should be 0
-                    if kind >= 0x01 && kind <= 0x0E {
-                        let data = crate::rva_resolver::read_pointer(lib_bytes, foff, ptr_size, is_le);
-                        if data != 0 { early_ok = false; break; }
-                    }
-                }
-                if !early_ok {
-                    // Debug: log first rejection near known-good position
-                    if pos >= 0x5362a70 && pos <= 0x5362a90 {
-                        let mut dbg = Vec::new();
-                        for ci in 0..3usize {
-                            let eoff = pos + ci * ptr_size;
-                            let ptr = crate::rva_resolver::read_pointer(lib_bytes, eoff, ptr_size, is_le);
-                            let foff = elf_info.vaddr_to_file_offset(ptr).map(|o| o as usize);
-                            let kind = foff.and_then(|f| if f + type_kind_offset + 1 <= lib_bytes.len() { Some(lib_bytes[f + type_kind_offset]) } else { None });
-                            dbg.push(format!("[{}]=0x{:x}->foff={:?} kind={:?}", ci, ptr, foff, kind));
-                        }
-                        debug_log.push(format!("  scan REJECTED at pos=0x{:x}: {}", pos, dbg.join(", ")));
-                    }
-                    pos += step;
+            // Search for occurrences of types_count as u32 LE at pointer-aligned positions
+            for pos in (seg_start..seg_end.saturating_sub(8)).step_by(ptr_size) {
+                if pos + 4 > lib_bytes.len() { break; }
+
+                // Check if types_count bytes match at this position
+                if lib_bytes[pos] != count_bytes[0]
+                    || lib_bytes[pos + 1] != count_bytes[1]
+                    || lib_bytes[pos + 2] != count_bytes[2]
+                    || lib_bytes[pos + 3] != count_bytes[3]
+                {
                     continue;
                 }
 
-                // Check entries at probe indices across the full array range.
-                // For CLASS/VALUETYPE, also validate that the data field is a
-                // plausible TypeDefIndex (< td_count). This rejects wrong arrays
-                // where the "data" field is actually a pointer value (millions).
-                let mut matches = 0usize;
+                // Found types_count. Read the pointer at +ptr_size (the field after the count).
+                // In MetadataRegistration, types_count is at offset 48 and types ptr is at offset 56.
+                // The count field is int32_t (4 bytes) + 4 bytes padding, then the pointer (8 bytes).
+                let ptr_pos = pos + ptr_size;
+                if ptr_pos + ptr_size > lib_bytes.len() { continue; }
+
+                let types_ptr = if ptr_size == 8 {
+                    crate::rva_resolver::read_u64(lib_bytes, ptr_pos, is_le)
+                } else {
+                    crate::rva_resolver::read_u32(lib_bytes, ptr_pos, is_le) as u64
+                };
+
+                if types_ptr < 0x10000 { continue; }
+
+                // Validate: types_ptr must map to a file offset in a data segment
+                let types_foff = match elf_info.vaddr_to_file_offset(types_ptr) {
+                    Some(o) => o as usize,
+                    None => continue,
+                };
+
+                // Check that the array fits in the file
+                if types_foff + types_count * ptr_size > lib_bytes.len() { continue; }
+
+                // Validate: sample 10 entries from the types array.
+                // Each entry should be a pointer to a valid Il2CppType struct
+                // with a reasonable type kind byte (1-0x1E).
+                let mut valid = 0usize;
                 let mut checked = 0usize;
-                for &pi in &probe_indices {
-                    let entry_off = pos + pi * ptr_size;
-                    if entry_off + ptr_size > lib_bytes.len() { continue; }
-                    let type_ptr = crate::rva_resolver::read_pointer(lib_bytes, entry_off, ptr_size, is_le);
-                    if type_ptr == 0 || type_ptr < 0x10000 { continue; }
-                    let type_foff = match elf_info.vaddr_to_file_offset(type_ptr) {
-                        Some(o) => o as usize,
-                        None => continue,
+                let step_size = if types_count > 20 { types_count / 10 } else { 1 };
+
+                for i in (0..types_count).step_by(step_size).take(10) {
+                    let entry_off = types_foff + i * ptr_size;
+                    if entry_off + ptr_size > lib_bytes.len() { break; }
+
+                    let type_struct_va = if ptr_size == 8 {
+                        crate::rva_resolver::read_u64(lib_bytes, entry_off, is_le)
+                    } else {
+                        crate::rva_resolver::read_u32(lib_bytes, entry_off, is_le) as u64
                     };
-                    if type_foff + type_kind_offset + 1 > lib_bytes.len() { continue; }
+                    if type_struct_va == 0 || type_struct_va < 0x10000 { checked += 1; continue; }
+
+                    let type_foff = match elf_info.vaddr_to_file_offset(type_struct_va) {
+                        Some(o) => o as usize,
+                        None => { checked += 1; continue; },
+                    };
+                    if type_foff + type_kind_offset + 1 > lib_bytes.len() { checked += 1; continue; }
+
                     let kind = lib_bytes[type_foff + type_kind_offset];
-                    if kind < 1 || kind > 0x1E { continue; }
-                    // For primitives, data should be 0
-                    if kind >= 0x01 && kind <= 0x0E {
-                        let data = crate::rva_resolver::read_pointer(lib_bytes, type_foff, ptr_size, is_le);
-                        if data != 0 { continue; }
-                    }
-                    matches += 1;
-                }
-                checked = probe_indices.len();
-
-                // 95% of probes must match — allow a few edge-case failures
-                if checked >= 10 && matches * 100 >= checked * 95 {
-                    // Additional check: entries should be increasing pointers with
-                    // consistent stride (Il2CppType structs are laid out sequentially).
-                    let mut increasing = true;
-                    let mut consistent_stride = true;
-                    let first_ptr = crate::rva_resolver::read_pointer(lib_bytes, pos, ptr_size, is_le);
-                    let second_ptr = crate::rva_resolver::read_pointer(lib_bytes, pos + ptr_size, ptr_size, is_le);
-                    if second_ptr <= first_ptr { increasing = false; }
-                    if increasing {
-                        let expected_stride = second_ptr - first_ptr;
-                        // Il2CppType is ptr_size + 4 bytes, aligned to ptr_size
-                        // Typical stride is 16 bytes on 64-bit
-                        if expected_stride < 8 || expected_stride > 64 {
-                            consistent_stride = false;
-                        }
-                        if consistent_stride {
-                            // Check 5 more entries
-                            for si in 2..7usize {
-                                let eoff = pos + si * ptr_size;
-                                if eoff + ptr_size > lib_bytes.len() { break; }
-                                let p = crate::rva_resolver::read_pointer(lib_bytes, eoff, ptr_size, is_le);
-                                let prev = crate::rva_resolver::read_pointer(lib_bytes, eoff - ptr_size, ptr_size, is_le);
-                                if p <= prev { increasing = false; break; }
-                                let stride = p - prev;
-                                if stride < 8 || stride > 64 { consistent_stride = false; break; }
-                            }
+                    if kind >= 1 && kind <= 0x1E {
+                        // For primitives (kind 1-14), data union should be 0
+                        if kind <= 0x0E {
+                            let data = if ptr_size == 8 {
+                                crate::rva_resolver::read_u64(lib_bytes, type_foff, is_le)
+                            } else {
+                                crate::rva_resolver::read_u32(lib_bytes, type_foff, is_le) as u64
+                            };
+                            if data == 0 { valid += 1; }
+                        } else {
+                            valid += 1;
                         }
                     }
-
-                    if increasing && consistent_stride {
-                        let array_va = seg_va + (pos - seg_start) as u64;
-                        // Score: prefer smaller stride (Il2CppType is ~16 bytes),
-                        // then more probe matches. Lower score = better.
-                        let stride = if second_ptr > first_ptr { (second_ptr - first_ptr) as usize } else { 64 };
-                        let score = stride * 1000 - matches;
-                        debug_log.push(format!("  scan CANDIDATE: va=0x{:x} pos=0x{:x} matches={}/{} stride={} score={}", array_va, pos, matches, checked, stride, score));
-                        if best.is_none() || score < best.as_ref().unwrap().2 {
-                            best = Some((array_va, min_array_entries, score));
-                        }
-                    }
+                    checked += 1;
                 }
 
-                pos += step;
+                // Require 8/10 valid entries
+                if checked >= 8 && valid >= 8 {
+                    let array_va = elf_info.file_offset_to_vaddr(types_foff as u64)
+                        .unwrap_or(seg_va + (types_foff as u64 - seg.offset));
+                    debug_log.push(format!("  count-scan: types_count={} at foff=0x{:x}, types_ptr=0x{:x} (foff=0x{:x}), valid={}/{}",
+                        types_count, pos, types_ptr, types_foff, valid, checked));
+                    return Some((array_va, types_count));
+                }
             }
         }
 
-        if let Some((ptr, count, score)) = &best {
-            debug_log.push(format!("  scan BEST: ptr=0x{:x} count_hint={} score={}", ptr, count, score));
-        } else {
-            debug_log.push("  scan: no valid candidate found".to_string());
-        }
-        best.map(|(ptr, count, _)| (ptr, count))
+        debug_log.push("  count-scan: no valid candidate found".to_string());
+        None
     }
 
     pub fn write(
