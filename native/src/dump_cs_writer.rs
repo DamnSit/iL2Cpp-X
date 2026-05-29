@@ -1447,16 +1447,16 @@ impl DumpCsWriter {
             });
             let params = build_parameter_list(metadata, method, type_names);
             let return_type = resolve_type_name(method.return_type, type_names);
-            let rva_comment = if let Some(rva) = rva_result.method_rvas.get(&method_idx) {
-                format!(" /* RVA: {}, Size: {} */", rva.hex_rva(), rva.hex_size())
-            } else {
-                String::new()
-            };
             let vis = method_visibility(method.flags);
+            if let Some(rva) = rva_result.method_rvas.get(&method_idx) {
+                let va = rva.rva;
+                let offset = if va >= 0x4000 { va - 0x4000 } else { va };
+                writeln!(w, "{}// RVA: {} Offset: {} VA: {}", indent, rva.hex_rva(), format!("0x{:08X}", offset), rva.hex_rva())?;
+            }
             writeln!(
                 w,
-                "{}{} {} {}({}) {{ }}{}",
-                indent, vis, return_type, name, params, rva_comment
+                "{}{} {} {}({}) {{ }}",
+                indent, vis, return_type, name, params
             )?;
         }
         writeln!(w)?;
