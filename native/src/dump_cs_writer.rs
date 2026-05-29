@@ -25,13 +25,13 @@ impl DumpCsWriter {
         elf_info: Option<&ElfInfo>,
         lib_bytes: Option<&[u8]>,
         debug_log: &mut Vec<String>,
-    ) -> std::collections::HashMap<usize, String> {
+    ) -> (std::collections::HashMap<usize, String>, Option<(u64, usize)>) {
         // Try to resolve from Il2CppType array in the ELF binary
         if let (Some(elf), Some(bytes)) = (elf_info, lib_bytes) {
             match Self::resolve_il2cpp_types(elf, bytes, metadata, debug_log) {
-                Some(map) => {
+                Some((map, types_va, types_cnt)) => {
                     debug_log.push(format!("Il2CppType resolved: {} types", map.len()));
-                    return map;
+                    return (map, Some((types_va, types_cnt)));
                 }
                 None => {
                     debug_log.push("Il2CppType resolution failed, using fallback".to_string());
@@ -50,7 +50,7 @@ impl DumpCsWriter {
             };
             map.insert(t.index, fqcn);
         }
-        map
+        (map, None)
     }
 
     /// Try to resolve Il2CppType array from the ELF binary.
@@ -67,7 +67,7 @@ impl DumpCsWriter {
         lib_bytes: &[u8],
         metadata: &MetadataParseResult,
         debug_log: &mut Vec<String>,
-    ) -> Option<std::collections::HashMap<usize, String>> {
+    ) -> Option<(std::collections::HashMap<usize, String>, u64, usize)> {
         let is_le = elf_info.is_little_endian;
         let is_64 = elf_info.is_64bit;
         let ptr_size: usize = if is_64 { 8 } else { 4 };
@@ -357,7 +357,7 @@ impl DumpCsWriter {
             debug_log.push(format!("  ... max key = {}", sample_keys.last().unwrap()));
         }
 
-        Some(map)
+        Some((map, types_array_va, types_count))
     }
 
     /// Resolve CLASS/VALUETYPE type name from datapoint.
@@ -1035,6 +1035,93 @@ impl DumpCsWriter {
         None
     }
 
+    /// Resolve field offsets from MetadataRegistration.fieldOffsets in the ELF binary.
+    /// Returns a map from type_index → base field offset (byte offset in object layout).
+    fn resolve_field_offsets(
+        lib_bytes: &[u8],
+        elf_info: &ElfInfo,
+        types_array_va: u64,
+        types_count: usize,
+        debug_log: &mut Vec<String>,
+    ) -> std::collections::HashMap<usize, u32> {
+        let is_64 = elf_info.is_64bit;
+        let is_le = elf_info.is_little_endian;
+        let ptr_size: usize = if is_64 { 8 } else { 4 };
+        let mut result = std::collections::HashMap::new();
+
+        // Apply relocations to get valid pointers
+        let patched = crate::rva_resolver::apply_relocations(lib_bytes, elf_info);
+        let bytes = &patched;
+
+        // Find the MetadataRegistration struct by looking for the types_array_va
+        // in data segments. The MR has (count, pointer) pairs. types is at pair[3].
+        // fieldOffsets is at pair[6]: count at +96, pointer at +104 (64-bit)
+        // or count at +48, pointer at +52 (32-bit)
+        let data_segs: Vec<_> = elf_info.load_segments().into_iter()
+            .filter(|s| (s.flags & 0x1) == 0 && s.filesz > 0)
+            .collect();
+
+        let pair_size = ptr_size * 2;
+        let types_pair_offset = 6 * pair_size; // pair[3] = types
+
+        for seg in &data_segs {
+            let seg_start = seg.offset as usize;
+            let seg_end = (seg_start + seg.filesz as usize).min(bytes.len());
+            let seg_va = seg.vaddr;
+
+            for pos in (seg_start..seg_end.saturating_sub(types_pair_offset + pair_size)).step_by(ptr_size) {
+                // Check if types_array_va is at pos + types_pair_offset + ptr_size (the pointer part of pair[3])
+                let types_ptr_pos = pos + types_pair_offset + ptr_size;
+                if types_ptr_pos + ptr_size > bytes.len() { continue; }
+
+                let stored_ptr = if is_64 {
+                    crate::rva_resolver::read_u64(bytes, types_ptr_pos, is_le)
+                } else {
+                    crate::rva_resolver::read_u32(bytes, types_ptr_pos, is_le) as u64
+                };
+
+                if stored_ptr != types_array_va { continue; }
+
+                // Found the MR struct! Read fieldOffsets at pair[6]
+                let field_offsets_count_off = pos + 12 * pair_size; // pair[6].count
+                let field_offsets_ptr_off = field_offsets_count_off + ptr_size;
+                if field_offsets_ptr_off + ptr_size > bytes.len() { continue; }
+
+                let fo_count = crate::rva_resolver::read_u32(bytes, field_offsets_count_off, is_le) as usize;
+                let fo_ptr = if is_64 {
+                    crate::rva_resolver::read_u64(bytes, field_offsets_ptr_off, is_le)
+                } else {
+                    crate::rva_resolver::read_u32(bytes, field_offsets_ptr_off, is_le) as u64
+                };
+
+                if fo_count == 0 || fo_count > 500_000 || fo_ptr < 0x10000 { continue; }
+
+                let fo_foff = match elf_info.vaddr_to_file_offset(fo_ptr) {
+                    Some(o) => o as usize,
+                    None => continue,
+                };
+
+                if fo_foff + fo_count * 4 > bytes.len() { continue; }
+
+                // Read fieldOffsets array (uint32_t per type)
+                let actual_count = fo_count.min(types_count);
+                for i in 0..actual_count {
+                    let off = fo_foff + i * 4;
+                    let val = crate::rva_resolver::read_u32(bytes, off, is_le);
+                    if val > 0 {
+                        result.insert(i, val);
+                    }
+                }
+
+                debug_log.push(format!("  fieldOffsets: count={} ptr=0x{:x} resolved={}", fo_count, fo_ptr, result.len()));
+                return result;
+            }
+        }
+
+        debug_log.push("  fieldOffsets: MetadataRegistration not found".to_string());
+        result
+    }
+
     pub fn write(
         &self,
         metadata: &MetadataParseResult,
@@ -1055,7 +1142,18 @@ impl DumpCsWriter {
     ) -> std::io::Result<usize> {
         let file = std::fs::File::create(output_path)?;
         let mut w = BufWriter::new(file);
-        let type_names = Self::build_type_name_map(metadata, elf_info, lib_bytes, debug_log);
+        let (type_names, types_array_info) = Self::build_type_name_map(metadata, elf_info, lib_bytes, debug_log);
+
+        // Resolve field offsets from MetadataRegistration
+        let field_offsets = if let (Some(elf), Some(bytes)) = (elf_info, lib_bytes) {
+            if let Some((types_va, types_cnt)) = types_array_info {
+                Self::resolve_field_offsets(bytes, elf, types_va, types_cnt, debug_log)
+            } else {
+                std::collections::HashMap::new()
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
 
         // Build byval_type_index → FQCN map for parent resolution
         let mut byval_to_name: std::collections::HashMap<i32, String> = std::collections::HashMap::new();
@@ -1105,7 +1203,7 @@ impl DumpCsWriter {
                     if type_def.name.is_empty() {
                         continue;
                     }
-                    self.write_type(&mut w, metadata, type_def, rva_result, &type_names, &byval_to_name)?;
+                    self.write_type(&mut w, metadata, type_def, rva_result, &type_names, &byval_to_name, &field_offsets)?;
                     written += 1;
                 }
             }
@@ -1122,7 +1220,7 @@ impl DumpCsWriter {
                 if type_def.name.is_empty() {
                     continue;
                 }
-                self.write_type(&mut w, metadata, type_def, rva_result, &type_names, &byval_to_name)?;
+                self.write_type(&mut w, metadata, type_def, rva_result, &type_names, &byval_to_name, &field_offsets)?;
                 written += 1;
             }
         }
@@ -1139,6 +1237,7 @@ impl DumpCsWriter {
         rva_result: &RvaResult,
         type_names: &std::collections::HashMap<usize, String>,
         byval_to_name: &std::collections::HashMap<i32, String>,
+        field_offsets: &std::collections::HashMap<usize, u32>,
     ) -> std::io::Result<()> {
         let namespace = sanitize_namespace(&type_def.namespace_name);
         let indent;
@@ -1252,7 +1351,7 @@ impl DumpCsWriter {
         }
 
         // Fields
-        self.write_fields(w, metadata, type_def, &format!("{}    ", indent), type_names)?;
+        self.write_fields(w, metadata, type_def, &format!("{}    ", indent), type_names, field_offsets)?;
 
         // Methods
         self.write_methods(w, metadata, type_def, &format!("{}    ", indent), rva_result, type_names)?;
@@ -1272,6 +1371,7 @@ impl DumpCsWriter {
         type_def: &MetadataTypeDefinition,
         indent: &str,
         type_names: &std::collections::HashMap<usize, String>,
+        field_offsets: &std::collections::HashMap<usize, u32>,
     ) -> std::io::Result<()> {
         let start = type_def.field_start;
         if type_def.field_count == 0 || start >= metadata.fields.len() {
@@ -1282,7 +1382,14 @@ impl DumpCsWriter {
             return Ok(());
         }
 
-        writeln!(w, "{}// Fields", indent)?;
+        // Get base field offset for this type
+        let base_offset = field_offsets.get(&type_def.index).copied().unwrap_or(0);
+
+        if base_offset > 0 {
+            writeln!(w, "{}// Fields (base offset: 0x{:X})", indent, base_offset)?;
+        } else {
+            writeln!(w, "{}// Fields", indent)?;
+        }
         for field_idx in start..end {
             let field = &metadata.fields[field_idx];
             let default_name = format!("field_{}", field_idx);
@@ -1293,11 +1400,19 @@ impl DumpCsWriter {
             });
             let type_name = resolve_type_name(field.type_index, type_names);
             let vis = field_visibility(type_def.flags);
-            writeln!(
-                w,
-                "{}{} {} {};",
-                indent, vis, type_name, name
-            )?;
+            if let Some(default_val) = metadata.field_default_values.get(&field_idx) {
+                writeln!(
+                    w,
+                    "{}{} const {} {} = {};",
+                    indent, vis, type_name, name, default_val
+                )?;
+            } else {
+                writeln!(
+                    w,
+                    "{}{} {} {};",
+                    indent, vis, type_name, name
+                )?;
+            }
         }
         writeln!(w)?;
         Ok(())

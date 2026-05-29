@@ -83,4 +83,5 @@ pub struct MetadataParseResult {
     pub methods: Vec<MetadataMethodDefinition>,
     pub parameters: Vec<MetadataParameterDefinition>,
     pub string_offsets: Vec<u32>,
+    pub field_default_values: std::collections::HashMap<usize, String>,
 }
