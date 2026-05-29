@@ -403,18 +403,8 @@ impl MetadataParser {
             &[24, 28, 32, 36, 40, 44],
             use_varint, version,
         );
-        // v29+ removed the token field from FieldDef and ParameterDef, so stride is 8.
-        // For older versions, stride is 12 (nameIndex + typeIndex + token).
-        let field_def_size = if version >= 29 {
-            8
-        } else {
-            detect_stride(reader, &ranges, "fields", &[8, 12, 16], use_varint, version)
-        };
-        let param_def_size = if version >= 29 {
-            8
-        } else {
-            detect_stride(reader, &ranges, "parameters", &[8, 12, 16], use_varint, version)
-        };
+        let field_def_size = detect_stride(reader, &ranges, "fields", &[8, 12, 16], use_varint, version);
+        let param_def_size = detect_stride(reader, &ranges, "parameters", &[8, 12, 16], use_varint, version);
 
         STRIDE_LOGS.with(|logs| {
             logs.borrow_mut().push(format!(
@@ -676,6 +666,8 @@ fn detect_method_offsets(
             (8, 12, 28, 20, 22, 24), // v24-v30 standard (4-byte genericContainerIndex)
         ],
         34..=36 => vec![
+            // v31: genericContainerIndex(i32) at +16, token at +24, flags at +28, iflags at +32, paramCount at +34
+            (8, 16, 24, 34, 28, 32),
             // 64-bit genericContainerIndex at +16 (8 bytes)
             (8, 12, 32, 24, 26, 28),
             // 4-byte genericContainerIndex at +16 + extra field at end

@@ -242,6 +242,29 @@ impl RvaResolver {
             }
         }
 
+        // Compute method sizes from sorted RVAs: size[i] = rva[i+1] - rva[i]
+        {
+            let mut sorted: Vec<(usize, u64)> = method_rvas
+                .iter()
+                .filter(|(_, m)| m.size == 0 && m.rva > 0)
+                .map(|(&idx, m)| (idx, m.rva))
+                .collect();
+            sorted.sort_by_key(|&(_, rva)| rva);
+            for i in 0..sorted.len() {
+                let (idx, rva) = sorted[i];
+                let next_rva = if i + 1 < sorted.len() {
+                    sorted[i + 1].1
+                } else {
+                    code_end
+                };
+                if next_rva > rva {
+                    if let Some(m) = method_rvas.get_mut(&idx) {
+                        m.size = next_rva - rva;
+                    }
+                }
+            }
+        }
+
         let unresolved = method_count.saturating_sub(method_rvas.len());
         RvaResult {
             method_rvas,

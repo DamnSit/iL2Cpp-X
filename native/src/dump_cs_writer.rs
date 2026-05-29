@@ -1292,10 +1292,11 @@ impl DumpCsWriter {
                 &field.name
             });
             let type_name = resolve_type_name(field.type_index, type_names);
+            let vis = field_visibility(type_def.flags);
             writeln!(
                 w,
-                "{}public {} {};",
-                indent, type_name, name
+                "{}{} {} {};",
+                indent, vis, type_name, name
             )?;
         }
         writeln!(w)?;
@@ -1333,10 +1334,11 @@ impl DumpCsWriter {
             } else {
                 String::new()
             };
+            let vis = method_visibility(method.flags);
             writeln!(
                 w,
-                "{}public {} {}({}) {{ }}{}",
-                indent, return_type, name, params, rva_comment
+                "{}{} {} {}({}) {{ }}{}",
+                indent, vis, return_type, name, params, rva_comment
             )?;
         }
         writeln!(w)?;
@@ -1395,6 +1397,31 @@ fn sanitize_method_name(value: &str) -> String {
         ".ctor" => "ctor".to_string(),
         ".cctor" => "cctor".to_string(),
         _ => sanitize_identifier(value),
+    }
+}
+
+fn method_visibility(flags: u16) -> &'static str {
+    match flags & 0x0007 {
+        0x0001 => "private",
+        0x0002 => "protected",
+        0x0003 => "internal",
+        0x0004 => "protected internal",
+        0x0006 => "public",
+        _ => "public",
+    }
+}
+
+fn field_visibility(type_flags: u32) -> &'static str {
+    // TypeAttributes visibility: bits 0-2
+    match type_flags & 0x0007 {
+        0x0001 => "public",
+        0x0002 => "public", // public type → public fields (approximation)
+        0x0003 => "internal",
+        0x0004 => "internal",
+        0x0005 => "protected internal",
+        0x0006 => "private",
+        0x0007 => "private",
+        _ => "public",
     }
 }
 
