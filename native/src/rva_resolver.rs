@@ -627,6 +627,14 @@ impl RvaResolver {
         let mut modules_processed = 0usize;
         let mut global_method_offset: usize = 0;
 
+        // Build image name → (type_start, type_count) map for matching modules to images
+        let image_method_counts: Vec<usize> = metadata.images.iter().map(|img| {
+            metadata.types.iter()
+                .filter(|td| td.index >= img.type_start && td.index < img.type_start + img.type_count)
+                .map(|td| td.method_count)
+                .sum()
+        }).collect();
+
         for mod_idx in 0..modules_count {
             let mod_ptr_foff = modules_array_foff + mod_idx * pointer_size;
             if mod_ptr_foff + pointer_size > lib_bytes.len() {
@@ -634,26 +642,32 @@ impl RvaResolver {
             }
             let mod_va = read_pointer(lib_bytes, mod_ptr_foff, pointer_size, is_le);
             if mod_va == 0 {
+                global_method_offset += image_method_counts.get(mod_idx).copied().unwrap_or(0);
                 continue;
             }
 
             let mod_foff = match elf_info.vaddr_to_file_offset(mod_va) {
                 Some(o) => o as usize,
-                None => continue,
+                None => {
+                    global_method_offset += image_method_counts.get(mod_idx).copied().unwrap_or(0);
+                    continue;
+                }
             };
             if mod_foff + 24 > lib_bytes.len() {
+                global_method_offset += image_method_counts.get(mod_idx).copied().unwrap_or(0);
                 continue;
             }
 
             // Il2CppCodeGenModule layout (64-bit):
             //   +0:  const char* moduleName
-            //   +8:  size_t methodPointerCount (actually i64 on 64-bit)
-            //   +16: const Il2CppMethodPointer* methodPointers
+            //   +8:  const Il2CppMethodPointer* methodPointers
+            //   +16: const Il2CppMethodPointer* adjustorThunkMethodPointers
+            //   ... more fields ...
+            //   methodPointerCount at a later offset (varies by version)
             let name_va = read_u64(lib_bytes, mod_foff, is_le);
-            let method_count = read_u64(lib_bytes, mod_foff + 8, is_le) as usize;
-            let method_ptrs_va = read_u64(lib_bytes, mod_foff + 16, is_le);
+            let method_ptrs_va = read_u64(lib_bytes, mod_foff + 8, is_le);
 
-            // Read module name for debugging
+            // Read module name
             let mut module_name = String::new();
             if name_va > 0x10000 {
                 if let Some(name_foff) = elf_info.vaddr_to_file_offset(name_va) {
@@ -673,31 +687,42 @@ impl RvaResolver {
                 }
             }
 
-            if method_count == 0 || method_ptrs_va == 0 {
-                if mod_idx < 5 {
+            // Match module to metadata image by name
+            let image_method_count = if let Some(img) = metadata.images.iter().find(|img| {
+                module_name.contains(&img.name) || img.name.contains(&module_name)
+            }) {
+                image_method_counts.get(img.index).copied().unwrap_or(0)
+            } else {
+                image_method_counts.get(mod_idx).copied().unwrap_or(0)
+            };
+
+            if method_ptrs_va == 0 {
+                if mod_idx < 10 {
                     self.debug_log.push(format!(
-                        "    module[{}] \"{}\": count=0 or null ptrs",
-                        mod_idx, module_name
+                        "    module[{}] \"{}\": null methodPointers, advancing by {}",
+                        mod_idx, module_name, image_method_count
                     ));
                 }
+                global_method_offset += image_method_count;
                 continue;
             }
 
             let method_ptrs_foff = match elf_info.vaddr_to_file_offset(method_ptrs_va) {
                 Some(o) => o as usize,
                 None => {
-                    if mod_idx < 5 {
+                    if mod_idx < 10 {
                         self.debug_log.push(format!(
                             "    module[{}] \"{}\": ptrs VA 0x{:x} not in segment",
                             mod_idx, module_name, method_ptrs_va
                         ));
                     }
+                    global_method_offset += image_method_count;
                     continue;
                 }
             };
 
-            // Read method pointer array
-            let max_count = std::cmp::min(method_count, 200000);
+            // Read method pointer array (use metadata count, not struct count)
+            let max_count = std::cmp::min(image_method_count, 200000);
             let mut method_ptrs: Vec<u64> = Vec::with_capacity(max_count);
             for i in 0..max_count {
                 let off = method_ptrs_foff + i * pointer_size;
@@ -709,12 +734,11 @@ impl RvaResolver {
             }
 
             if method_ptrs.is_empty() {
+                global_method_offset += image_method_count;
                 continue;
             }
 
-            // Map using global sequential indexing.
-            // All CodeGenModule method pointer arrays form one contiguous table:
-            // module[0] covers methods [0, count_0), module[1] covers [count_0, count_0+count_1), etc.
+            // Map using global sequential indexing
             let mut mapped = 0usize;
             for (local_idx, &ptr) in method_ptrs.iter().enumerate() {
                 let method_idx = global_method_offset + local_idx;
@@ -748,7 +772,7 @@ impl RvaResolver {
                     "    module[{}] \"{}\": count={} range=[{},{}) mapped={} ptrs=[{}]",
                     mod_idx,
                     module_name,
-                    method_count,
+                    image_method_count,
                     global_method_offset,
                     global_method_offset + method_ptrs.len(),
                     mapped,
@@ -756,7 +780,7 @@ impl RvaResolver {
                 ));
             }
 
-            global_method_offset += method_ptrs.len();
+            global_method_offset += image_method_count;
         }
 
         self.debug_log.push(format!(
