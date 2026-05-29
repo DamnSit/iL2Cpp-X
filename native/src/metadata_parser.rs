@@ -445,10 +445,10 @@ impl MetadataParser {
             };
 
         // ParameterDef type_index is always at +4:
+        // Parameter table layout differs from field table:
         // stride 8:  nameIndex(+0), typeIndex(+4)
-        // stride 12: nameIndex(+0), typeIndex(+4), token(+8)
-        // stride 16: nameIndex(+0), typeIndex(+4), token(+8), extra(+12)
-        let param_type_index = 4;
+        // stride 12: nameIndex(+0), token(+4, 0x08XXXXXX), typeIndex(+8)
+        let param_type_index = if param_def_size >= 12 { 8 } else { 4 };
 
         let config = VersionConfig {
             type_def_size,
@@ -491,6 +491,14 @@ impl MetadataParser {
         let methods = read_methods(reader, &ranges, &config);
         let parameters = read_parameters(reader, &ranges, &config);
         let field_default_values = read_field_default_values(reader, &ranges, &types);
+        let default_value_data = {
+            let dv_range = ranges.iter().find(|r| r.name == "fieldAndParameterDefaultValueData");
+            if let Some(r) = dv_range {
+                if r.offset + r.size <= reader.size() {
+                    reader.data()[r.offset..r.offset + r.size].to_vec()
+                } else { Vec::new() }
+            } else { Vec::new() }
+        };
 
         Ok(MetadataParseResult {
             magic,
@@ -505,6 +513,7 @@ impl MetadataParser {
             parameters,
             string_offsets,
             field_default_values,
+            default_value_data,
         })
     }
 }
@@ -957,7 +966,7 @@ fn read_field_default_values(
     reader: &BinaryReader,
     ranges: &[MetadataRange],
     _types: &[MetadataTypeDefinition],
-) -> std::collections::HashMap<usize, String> {
+) -> std::collections::HashMap<usize, (usize, usize, usize)> {
     let fdv_range = match ranges.iter().find(|r| r.name == "fieldDefaultValues") {
         Some(r) => r,
         None => return std::collections::HashMap::new(),
@@ -966,7 +975,6 @@ fn read_field_default_values(
         Some(r) => r,
         None => return std::collections::HashMap::new(),
     };
-    // fieldDefaultValues entry: fieldIndex(i32) + typeIndex(i32) + dataIndex(i32) = 12 bytes
     let entry_size = 12usize;
     let count = fdv_range.size / entry_size;
     let mut map = std::collections::HashMap::new();
@@ -977,61 +985,7 @@ fn read_field_default_values(
         let field_index = reader.read_i32_le(off).unwrap_or(0) as usize;
         let type_index = reader.read_i32_le(off + 4).unwrap_or(0) as usize;
         let data_index = reader.read_i32_le(off + 8).unwrap_or(0) as usize;
-
-        let data_off = data_range.offset + data_index;
-        if data_off + 8 > reader.size() { continue; }
-
-        // Read raw bytes for conversion
-        let raw = match reader.bytes(data_off, 8) {
-            Some(b) => b,
-            None => continue,
-        };
-
-        let value = match type_index {
-            0x02 => format!("{}", raw[0] != 0), // bool
-            0x03 => format!("'{}'", raw[0] as char), // char
-            0x04 => format!("{}", raw[0] as i8), // sbyte
-            0x05 => format!("{}", raw[0]), // byte
-            0x06 => format!("{}", i16::from_le_bytes([raw[0], raw[1]])), // short
-            0x07 => format!("{}", u16::from_le_bytes([raw[0], raw[1]])), // ushort
-            0x08 => format!("{}", i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])), // int
-            0x09 => format!("{}", u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])), // uint
-            0x0A => {
-                let v = i64::from_le_bytes([raw[0],raw[1],raw[2],raw[3],raw[4],raw[5],raw[6],raw[7]]);
-                format!("{}", v)
-            }
-            0x0B => {
-                let v = u64::from_le_bytes([raw[0],raw[1],raw[2],raw[3],raw[4],raw[5],raw[6],raw[7]]);
-                format!("{}", v)
-            }
-            0x0C => {
-                let bits = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-                format!("{}f", f32::from_bits(bits))
-            }
-            0x0D => {
-                let bits = u64::from_le_bytes([raw[0],raw[1],raw[2],raw[3],raw[4],raw[5],raw[6],raw[7]]);
-                format!("{}d", f64::from_bits(bits))
-            }
-            0x0E => {
-                // String default: data_index points into string literal data
-                // Read the string from the data range
-                let s_off = data_range.offset + data_index;
-                if s_off < reader.size() {
-                    let max_len = (data_range.offset + data_range.size).saturating_sub(s_off).min(1024);
-                    match reader.utf8_string(s_off, max_len) {
-                        Some(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
-                        None => "\"\"".to_string(),
-                    }
-                } else {
-                    "\"\"".to_string()
-                }
-            }
-            0x18 => "IntPtr.Zero".to_string(),
-            0x19 => "UIntPtr.Zero".to_string(),
-            _ => continue,
-        };
-
-        map.insert(field_index, value);
+        map.insert(field_index, (type_index, data_index, 0));
     }
 
     map

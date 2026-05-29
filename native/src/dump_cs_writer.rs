@@ -1400,11 +1400,14 @@ impl DumpCsWriter {
             });
             let type_name = resolve_type_name(field.type_index, type_names);
             let vis = field_visibility(type_def.flags);
-            if let Some(default_val) = metadata.field_default_values.get(&field_idx) {
+            let default_val = metadata.field_default_values.get(&field_idx).and_then(|&(_type_idx, data_idx, _)| {
+                resolve_default_value(&type_name, data_idx, &metadata.default_value_data, 0)
+            });
+            if let Some(val) = default_val {
                 writeln!(
                     w,
                     "{}{} const {} {} = {};",
-                    indent, vis, type_name, name, default_val
+                    indent, vis, type_name, name, val
                 )?;
             } else {
                 writeln!(
@@ -1537,6 +1540,84 @@ fn field_visibility(type_flags: u32) -> &'static str {
         0x0006 => "private",
         0x0007 => "private",
         _ => "public",
+    }
+}
+
+fn resolve_default_value(
+    type_name: &str,
+    data_abs_offset: usize,
+    data: &[u8],
+    _metadata_offset: usize,
+) -> Option<String> {
+    // data_abs_offset is the absolute offset in the metadata file
+    // We need to convert to offset within the data slice
+    // The data slice starts at default_value_data_offset in the metadata file
+    // But we stored it as a separate Vec, so offset 0 = start of data table
+    let off = data_abs_offset; // This is already relative to the data table start
+    if off >= data.len() { return None; }
+
+    match type_name {
+        "bool" => Some(format!("{}", data[off] != 0)),
+        "sbyte" => Some(format!("{}", data[off] as i8)),
+        "byte" => Some(format!("{}", data[off])),
+        "char" => Some(format!("'{}'", data[off] as char)),
+        "short" => {
+            if off + 2 > data.len() { return None; }
+            Some(format!("{}", i16::from_le_bytes([data[off], data[off+1]])))
+        }
+        "ushort" => {
+            if off + 2 > data.len() { return None; }
+            Some(format!("{}", u16::from_le_bytes([data[off], data[off+1]])))
+        }
+        "int" => {
+            if off + 4 > data.len() { return None; }
+            Some(format!("{}", i32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]])))
+        }
+        "uint" => {
+            if off + 4 > data.len() { return None; }
+            Some(format!("{}", u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]])))
+        }
+        "long" => {
+            if off + 8 > data.len() { return None; }
+            let v = i64::from_le_bytes([data[off],data[off+1],data[off+2],data[off+3],data[off+4],data[off+5],data[off+6],data[off+7]]);
+            Some(format!("{}", v))
+        }
+        "ulong" => {
+            if off + 8 > data.len() { return None; }
+            let v = u64::from_le_bytes([data[off],data[off+1],data[off+2],data[off+3],data[off+4],data[off+5],data[off+6],data[off+7]]);
+            Some(format!("{}", v))
+        }
+        "float" => {
+            if off + 4 > data.len() { return None; }
+            let bits = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+            Some(format!("{}f", f32::from_bits(bits)))
+        }
+        "double" => {
+            if off + 8 > data.len() { return None; }
+            let bits = u64::from_le_bytes([data[off],data[off+1],data[off+2],data[off+3],data[off+4],data[off+5],data[off+6],data[off+7]]);
+            Some(format!("{}d", f64::from_bits(bits)))
+        }
+        "string" => {
+            // String default: ULEB128 length + UTF-8 bytes
+            if off >= data.len() { return None; }
+            let mut pos = off;
+            let mut length: u32 = 0;
+            let mut shift: u32 = 0;
+            loop {
+                if pos >= data.len() { return None; }
+                let byte = data[pos];
+                length |= ((byte & 0x7F) as u32) << shift;
+                pos += 1;
+                shift += 7;
+                if byte & 0x80 == 0 { break; }
+                if shift > 35 { return None; }
+            }
+            let end = pos + length as usize;
+            if end > data.len() { return None; }
+            let s = String::from_utf8_lossy(&data[pos..end]);
+            Some(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+        }
+        _ => None,
     }
 }
 
