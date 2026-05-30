@@ -975,17 +975,24 @@ fn read_field_default_values(
         Some(r) => r,
         None => return std::collections::HashMap::new(),
     };
-    let entry_size = 12usize;
-    let count = fdv_range.size / entry_size;
+    let fdv_range_size = fdv_range.size;
+    let entry_size = if fdv_range_size % 12 == 0 { 12 } else { 8 };
+    let has_type_index = entry_size == 12;
+    let count = fdv_range_size / entry_size;
     let mut map = std::collections::HashMap::new();
 
     for i in 0..count {
         let off = fdv_range.offset + i * entry_size;
         if off + entry_size > reader.size() { break; }
         let field_index = reader.read_i32_le(off).unwrap_or(0) as usize;
-        let type_index = reader.read_i32_le(off + 4).unwrap_or(0) as usize;
-        let data_index = reader.read_i32_le(off + 8).unwrap_or(0) as usize;
-        map.insert(field_index, (type_index, data_index, 0));
+        if has_type_index {
+            let type_index = reader.read_i32_le(off + 4).unwrap_or(0) as usize;
+            let data_index = reader.read_i32_le(off + 8).unwrap_or(0) as usize;
+            map.insert(field_index, (type_index, data_index, data_index));
+        } else {
+            let data_index = reader.read_i32_le(off + 4).unwrap_or(0) as usize;
+            map.insert(field_index, (0, data_index, data_index));
+        }
     }
 
     map

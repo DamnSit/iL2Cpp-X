@@ -163,6 +163,7 @@ class DumpCsWriter(private val settings: DumpSettings? = null) {
     }
 
     private fun resolveTypeName(typeIndex: Int): String {
+        if (typeIndex < 0 || typeIndex > 500000) return "object"
         return resolvedTypeNames[typeIndex] ?: "T$typeIndex"
     }
 

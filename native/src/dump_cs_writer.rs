@@ -25,13 +25,13 @@ impl DumpCsWriter {
         elf_info: Option<&ElfInfo>,
         lib_bytes: Option<&[u8]>,
         debug_log: &mut Vec<String>,
-    ) -> (std::collections::HashMap<usize, String>, Option<(u64, usize)>) {
+    ) -> (std::collections::HashMap<usize, String>, Option<(u64, usize)>, std::collections::HashMap<usize, u16>) {
         // Try to resolve from Il2CppType array in the ELF binary
         if let (Some(elf), Some(bytes)) = (elf_info, lib_bytes) {
             match Self::resolve_il2cpp_types(elf, bytes, metadata, debug_log) {
-                Some((map, types_va, types_cnt)) => {
+                Some((map, types_va, types_cnt, attrs_map)) => {
                     debug_log.push(format!("Il2CppType resolved: {} types", map.len()));
-                    return (map, Some((types_va, types_cnt)));
+                    return (map, Some((types_va, types_cnt)), attrs_map);
                 }
                 None => {
                     debug_log.push("Il2CppType resolution failed, using fallback".to_string());
@@ -50,7 +50,7 @@ impl DumpCsWriter {
             };
             map.insert(t.index, fqcn);
         }
-        (map, None)
+        (map, None, std::collections::HashMap::new())
     }
 
     /// Try to resolve Il2CppType array from the ELF binary.
@@ -67,7 +67,7 @@ impl DumpCsWriter {
         lib_bytes: &[u8],
         metadata: &MetadataParseResult,
         debug_log: &mut Vec<String>,
-    ) -> Option<(std::collections::HashMap<usize, String>, u64, usize)> {
+    ) -> Option<(std::collections::HashMap<usize, String>, u64, usize, std::collections::HashMap<usize, u16>)> {
         let is_le = elf_info.is_little_endian;
         let is_64 = elf_info.is_64bit;
         let ptr_size: usize = if is_64 { 8 } else { 4 };
@@ -141,6 +141,7 @@ impl DumpCsWriter {
         debug_log.push(format!("types_array_va=0x{:x} foff=0x{:x} count={}", types_array_va, types_ptr_array_foff, types_count));
 
         let mut map = std::collections::HashMap::new();
+        let mut attrs_map = std::collections::HashMap::new();
         // TypeDef index → name (for resolving CLASS/VALUETYPE data)
         let mut td_names = std::collections::HashMap::new();
         for td in &metadata.types {
@@ -253,6 +254,9 @@ impl DumpCsWriter {
             } else {
                 crate::rva_resolver::read_u32(bytes, type_foff + data_offset, is_le) as usize
             };
+            // Read attrs from bitfield word (lower 16 bits)
+            let type_attrs = crate::rva_resolver::read_u32(bytes, type_foff + ptr_size, is_le) as u16;
+            attrs_map.insert(i, type_attrs);
 
             let name = match type_kind {
                 // Primitives (Il2CppTypeEnum):
@@ -357,7 +361,7 @@ impl DumpCsWriter {
             debug_log.push(format!("  ... max key = {}", sample_keys.last().unwrap()));
         }
 
-        Some((map, types_array_va, types_count))
+        Some((map, types_array_va, types_count, attrs_map))
     }
 
     /// Resolve CLASS/VALUETYPE type name from datapoint.
@@ -1062,7 +1066,7 @@ impl DumpCsWriter {
             .collect();
 
         let pair_size = ptr_size * 2;
-        let types_pair_offset = 6 * pair_size; // pair[3] = types
+        let types_pair_offset = 3 * pair_size; // pair[3] = types
 
         for seg in &data_segs {
             let seg_start = seg.offset as usize;
@@ -1083,7 +1087,7 @@ impl DumpCsWriter {
                 if stored_ptr != types_array_va { continue; }
 
                 // Found the MR struct! Read fieldOffsets at pair[6]
-                let field_offsets_count_off = pos + 12 * pair_size; // pair[6].count
+                let field_offsets_count_off = pos + 6 * pair_size; // pair[6].count
                 let field_offsets_ptr_off = field_offsets_count_off + ptr_size;
                 if field_offsets_ptr_off + ptr_size > bytes.len() { continue; }
 
@@ -1142,7 +1146,7 @@ impl DumpCsWriter {
     ) -> std::io::Result<usize> {
         let file = std::fs::File::create(output_path)?;
         let mut w = BufWriter::new(file);
-        let (type_names, types_array_info) = Self::build_type_name_map(metadata, elf_info, lib_bytes, debug_log);
+        let (type_names, types_array_info, attrs_map) = Self::build_type_name_map(metadata, elf_info, lib_bytes, debug_log);
 
         // Resolve field offsets from MetadataRegistration
         let field_offsets = if let (Some(elf), Some(bytes)) = (elf_info, lib_bytes) {
@@ -1203,7 +1207,7 @@ impl DumpCsWriter {
                     if type_def.name.is_empty() {
                         continue;
                     }
-                    self.write_type(&mut w, metadata, type_def, rva_result, &type_names, &byval_to_name, &field_offsets)?;
+                    self.write_type(&mut w, metadata, type_def, rva_result, &type_names, &byval_to_name, &field_offsets, &attrs_map)?;
                     written += 1;
                 }
             }
@@ -1220,7 +1224,7 @@ impl DumpCsWriter {
                 if type_def.name.is_empty() {
                     continue;
                 }
-                self.write_type(&mut w, metadata, type_def, rva_result, &type_names, &byval_to_name, &field_offsets)?;
+                self.write_type(&mut w, metadata, type_def, rva_result, &type_names, &byval_to_name, &field_offsets, &attrs_map)?;
                 written += 1;
             }
         }
@@ -1238,6 +1242,7 @@ impl DumpCsWriter {
         type_names: &std::collections::HashMap<usize, String>,
         byval_to_name: &std::collections::HashMap<i32, String>,
         field_offsets: &std::collections::HashMap<usize, u32>,
+        attrs_map: &std::collections::HashMap<usize, u16>,
     ) -> std::io::Result<()> {
         let namespace = sanitize_namespace(&type_def.namespace_name);
         let indent;
@@ -1351,7 +1356,7 @@ impl DumpCsWriter {
         }
 
         // Fields
-        self.write_fields(w, metadata, type_def, &format!("{}    ", indent), type_names, field_offsets)?;
+        self.write_fields(w, metadata, type_def, &format!("{}    ", indent), type_names, field_offsets, attrs_map)?;
 
         // Methods
         self.write_methods(w, metadata, type_def, &format!("{}    ", indent), rva_result, type_names)?;
@@ -1372,6 +1377,7 @@ impl DumpCsWriter {
         indent: &str,
         type_names: &std::collections::HashMap<usize, String>,
         field_offsets: &std::collections::HashMap<usize, u32>,
+        attrs_map: &std::collections::HashMap<usize, u16>,
     ) -> std::io::Result<()> {
         let start = type_def.field_start;
         if type_def.field_count == 0 || start >= metadata.fields.len() {
@@ -1399,9 +1405,15 @@ impl DumpCsWriter {
                 &field.name
             });
             let type_name = resolve_type_name(field.type_index, type_names);
-            let vis = field_visibility(type_def.flags);
+            let vis = attrs_map.get(&field.type_index)
+                .map(|&a| field_visibility_from_attrs(a))
+                .unwrap_or_else(|| field_visibility(type_def.flags));
             let default_val = metadata.field_default_values.get(&field_idx).and_then(|&(_type_idx, data_idx, _)| {
-                resolve_default_value(&type_name, data_idx, &metadata.default_value_data, 0)
+                if data_idx > 0 {
+                    resolve_default_value(&type_name, data_idx, &metadata.default_value_data, 0)
+                } else {
+                    None
+                }
             });
             if let Some(val) = default_val {
                 writeln!(
@@ -1451,7 +1463,7 @@ impl DumpCsWriter {
             if let Some(rva) = rva_result.method_rvas.get(&method_idx) {
                 let va = rva.rva;
                 let offset = if va >= 0x4000 { va - 0x4000 } else { va };
-                writeln!(w, "{}// RVA: {} Offset: {} VA: {}", indent, rva.hex_rva(), format!("0x{:08X}", offset), rva.hex_rva())?;
+                writeln!(w, "{}// RVA: 0x{:X} Offset: 0x{:X} VA: 0x{:X}", indent, va, offset, va)?;
             }
             writeln!(
                 w,
@@ -1526,6 +1538,19 @@ fn method_visibility(flags: u16) -> &'static str {
         0x0004 => "protected internal",
         0x0006 => "public",
         _ => "public",
+    }
+}
+
+fn field_visibility_from_attrs(attrs: u16) -> &'static str {
+    // FieldAttributes access mask: bits 0-2
+    match attrs & 0x0007 {
+        0x0001 => "private",
+        0x0002 => "private protected",
+        0x0003 => "internal",
+        0x0004 => "protected",
+        0x0005 => "protected internal",
+        0x0006 => "public",
+        _ => "private", // PrivateScope or unknown
     }
 }
 
