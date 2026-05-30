@@ -1624,6 +1624,11 @@ fn resolve_default_value(
         }
         "string" => {
             // String default: ULEB128 length + UTF-8 bytes
+            // In some metadata versions (v27+), the ULEB128 length counts
+            // UTF-16 code units rather than UTF-8 bytes. For ASCII strings
+            // this means length = 2 * actual_byte_count. We detect this by
+            // checking if the claimed length would overshoot into the next
+            // entry, and halve it if so.
             if off >= data.len() { return None; }
             let mut pos = off;
             let mut length: u32 = 0;
@@ -1637,9 +1642,47 @@ fn resolve_default_value(
                 if byte & 0x80 == 0 { break; }
                 if shift > 35 { return None; }
             }
+            // Try the raw length first; if it looks too large (contains
+            // non-printable chars or extends past what looks like a ULEB128
+            // boundary), halve it to convert from UTF-16 code unit count
+            // to UTF-8 byte count.
             let end = pos + length as usize;
-            if end > data.len() { return None; }
-            let s = String::from_utf8_lossy(&data[pos..end]);
+            let actual_length = if end <= data.len() {
+                // Check if halving the length gives a cleaner result.
+                // In metadata v27+, string lengths count UTF-16 code units
+                // not UTF-8 bytes, so length = 2 * actual_byte_count.
+                let half = length / 2;
+                let half_end = pos + half as usize;
+                if half > 0 && half_end <= data.len() && length == half * 2 {
+                    // Check if byte at half_end is 0x00 (null terminator or
+                    // empty next entry) or looks like a valid ULEB128 length
+                    // for the next entry (small value followed by printable ASCII
+                    // or another ULEB128 length byte)
+                    let next_byte = data[half_end];
+                    if next_byte == 0x00 {
+                        // Null terminator or empty next string - halved is correct
+                        half
+                    } else if next_byte <= 0x7F && half_end + 1 < data.len() {
+                        let next_data = data[half_end + 1];
+                        if next_data >= 0x20 && next_data < 0x7F {
+                            // Next entry: small ULEB128 + printable ASCII
+                            half
+                        } else {
+                            length
+                        }
+                    } else {
+                        length
+                    }
+                } else {
+                    length
+                }
+            } else {
+                // Length extends past data - try halved
+                length / 2
+            };
+            let final_end = pos + actual_length as usize;
+            if final_end > data.len() { return None; }
+            let s = String::from_utf8_lossy(&data[pos..final_end]);
             Some(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
         }
         _ => None,
